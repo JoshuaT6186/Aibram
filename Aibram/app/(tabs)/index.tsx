@@ -140,9 +140,15 @@ const DAY_SHORT   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 
 const suggestedDateToIso = (s: string): string => {
   if (!s) return today();
-  const l = s.toLowerCase();
+  const l = s.toLowerCase().trim();
   if (l === 'today')    return today();
   if (l === 'tomorrow') return dayOffset(1);
+  // Handle real ISO dates returned for long plans e.g. "2026-04-20"
+  if (/^\d{4}-\d{2}-\d{2}$/.test(l)) return l;
+  // Handle "day N" offset e.g. "day 15"
+  const dayMatch = l.match(/^day\s*(\d+)$/);
+  if (dayMatch) return dayOffset(parseInt(dayMatch[1]) - 1);
+  // Handle day names
   const target = DAY_NAMES.findIndex(d => d.toLowerCase() === l);
   if (target === -1) return today();
   const diff = (target - new Date().getDay() + 7) % 7 || 7;
@@ -152,8 +158,38 @@ const suggestedDateToIso = (s: string): string => {
 // ─── FIRESTORE HELPERS ────────────────────────────────────────────────────────
 const uid     = () => auth.currentUser?.uid ?? '';
 const dataRef = (key: string) => doc(db, 'users', uid(), 'data', key);
-const saveToFirestore   = async (key: string, value: any) => { if (!uid()) return; await setDoc(dataRef(key), { value }, { merge: true }); };
-const loadFromFirestore = async (key: string) => { if (!uid()) return null; const snap = await getDoc(dataRef(key)); return snap.exists() ? snap.data().value : null; };
+
+// Firestore rejects undefined anywhere inside objects/arrays.
+// This converts undefined to null before saving, including nested chat messages.
+const cleanForFirestore = (value: any): any => {
+  if (value === undefined) return null;
+  if (value === null) return null;
+
+  if (Array.isArray(value)) {
+    return value.map(cleanForFirestore);
+  }
+
+  if (typeof value === 'object') {
+    const cleaned: any = {};
+    Object.keys(value).forEach((key) => {
+      cleaned[key] = cleanForFirestore(value[key]);
+    });
+    return cleaned;
+  }
+
+  return value;
+};
+
+const saveToFirestore = async (key: string, value: any) => {
+  if (!uid()) return;
+  await setDoc(dataRef(key), { value: cleanForFirestore(value) }, { merge: true });
+};
+
+const loadFromFirestore = async (key: string) => {
+  if (!uid()) return null;
+  const snap = await getDoc(dataRef(key));
+  return snap.exists() ? snap.data().value : null;
+};
 
 // ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
 const requestNotificationPermission = async () => {
@@ -198,11 +234,13 @@ const buildProfileContext = (profile: any) => {
   return `\nUSER PROFILE:\n- Age: ${ageLabel}\n- Short-term: ${(profile.shortTermGoals||[]).join(', ')||'none'}\n- Mid-term: ${(profile.midTermGoals||[]).join(', ')||'none'}\n- Long-term: ${(profile.longTermGoals||[]).join(', ')||'none'}\n- Interests: ${(profile.interests||[]).join(', ')||'none'}\n- Struggle: ${profile.struggle||'not specified'}`;
 };
 
-const buildMessages = (userName: string, rank: string, xp: number, goals: any[], history: any[], userMsg: string, profile: any, energy: string, ideaContext?: string) => {
+const buildMessages = (userName: string, rank: string, xp: number, goals: any[], history: any[], userMsg: string, profile: any, energy: string, ideaContext?: string, summary?: string) => {
   const todayTasks = goals.filter((g: any) => g.date === today());
   const taskCtx = todayTasks.length ? todayTasks.map((t: any) => `"${t.text}"${t.timeLabel?` at ${t.timeLabel}`:''} (${t.completed?'done':'pending'})`).join(', ') : 'none';
   const energyNote = energy ? ENERGY_CONTEXT[energy] || '' : '';
   const ideaNote = ideaContext ? `\nIDEA CONTEXT (user is asking about this specific idea): "${ideaContext}"\nRespond directly about this idea first.` : '';
+  const summaryNote = summary ? `\nCONVERSATION MEMORY (summary of earlier messages):\n${summary}` : '';
+  const realDate = new Date().toLocaleDateString('en-US', {weekday:'long', year:'numeric', month:'long', day:'numeric'});
 
   const systemPrompt = `You are AIBRAM — an AI co-pilot helping ${userName} stay focused and reach their goals.
 
@@ -211,9 +249,21 @@ PERSONALITY:
 - You can help with anything — writing, questions, debates, creative work, off-topic stuff. Do it genuinely.
 - After off-topic help, naturally tie back to their world only if it makes sense. Don't force it.
 - Never end with a pushy challenge question. Only ask questions when they genuinely move the conversation.
-- Vary your style. 2-4 sentences for most messages. Longer only if the topic needs it.
+- Vary your style. 2-4 sentences for most messages. Longer only if the topic genuinely needs it — avoid bullet point lists unless essential.
 - Light profanity is okay very occasionally. Default to clean language — users can be as young as 13.
 - Never say: "absolutely", "great question", "of course!", "certainly", "I'd be happy to", "no fluff", "let's get after it", "crush your goals", "move the needle".
+
+DATE & KNOWLEDGE RULES:
+- Today's real date is: ${realDate}. Always use this. Never guess or rely on training data for the current date.
+- If a user claims it is a different date, acknowledge it playfully but ALWAYS use the real date for any task scheduling or date calculations.
+- Your knowledge has a training cutoff. If asked about current news or recent events, be honest that you may not have up to date information. Never fabricate news stories or events.
+- Never speculate about future events in a way that implies you know what will happen.
+- If asked to summarize the conversation, recap everything visible in your context — not just the last few messages.
+- Never confidently deny saying something earlier in the conversation. If unsure, say you do not recall rather than flatly denying it.
+
+IDENTITY:
+- You are Aibram. Stay in character when discussing limitations.
+- Say "I don't have real-time news access" not "I'm just an AI with a knowledge cutoff".
 
 ${energyNote}
 
@@ -223,21 +273,56 @@ CONTENT RULES:
 - Everything else — help like a real person.
 
 CONTEXT:
+- Today's date: ${realDate}
 - User: ${userName} | Rank: ${rank} (${xp} XP)
 - Today's tasks: ${taskCtx}
-${buildProfileContext(profile)}${ideaNote}
+${buildProfileContext(profile)}${ideaNote}${summaryNote}
 
-If user wants to plan their week: return action type "schedule".
+If user wants help planning, scheduling, or generating tasks:
+- Return action type "schedule" AND summarize the plan in the reply
+- Make every task SPECIFIC and actionable
+- If the user specifies a timeframe (2 weeks, 40 days etc.) ALWAYS respect it exactly
+- Spread tasks realistically across the full timeframe
+- Each task should be completable in one sitting
+
+TASK MANAGEMENT ACTIONS:
+- Delete/remove a specific task: type "delete_task", "taskKeyword" = key word from task name
+- Mark all today's tasks done: type "complete_today"
+- Reschedule a task: type "reschedule_task", "taskKeyword" = key word, "newDate" = YYYY-MM-DD
+- Clear all tasks for a day: type "clear_day", "targetDate" = YYYY-MM-DD
+- NEVER just say you did something without returning the correct action type
 
 RESPONSE FORMAT — always valid JSON:
 {
   "reply": "your response",
-  "action": { "type": "none"|"add_task"|"focus"|"add_subtasks"|"schedule", "task": "...", "time": "...", "parentTaskId": "...", "subtasks": [] }
+  "action": {
+    "type": "none"|"add_task"|"focus"|"add_subtasks"|"schedule"|"delete_task"|"complete_today"|"reschedule_task"|"clear_day",
+    "task": "task text if add_task",
+    "time": "H:MM AM/PM if mentioned",
+    "parentTaskId": "id if add_subtasks",
+    "subtasks": [],
+    "taskKeyword": "keyword to match task for delete/reschedule",
+    "newDate": "YYYY-MM-DD if reschedule",
+    "targetDate": "YYYY-MM-DD if clear_day"
+  }
 }
 Only return JSON. No markdown.`;
 
-  const ctx = history.slice(-6).map((m: any) => ({ role: m.sender === 'user' ? 'user' : 'assistant', content: m.text }));
+  const ctx = history.slice(-20).map((m: any) => ({ role: m.sender === 'user' ? 'user' : 'assistant', content: m.text ?? '' }));
   return [{ role: 'system', content: systemPrompt }, ...ctx, { role: 'user', content: userMsg }];
+};
+
+const generateConversationSummary = async (messages: any[], existingSummary: string): Promise<string> => {
+  const msgText = messages.map((m: any) => `${m.sender === 'user' ? 'User' : 'Aibram'}: ${m.text}`).join('\n');
+  const prompt = `Summarize this conversation in 3-4 sentences. Focus on: what topics were discussed, what tasks were added or changed, any important context about the user. Be concise — this summary will be used as memory for future messages.${existingSummary ? `\n\nPrevious summary to build on:\n${existingSummary}` : ''}\n\nConversation:\n${msgText}\n\nReturn only the summary text, no labels or formatting.`;
+  try {
+    const res = await Promise.race([
+      fetch('https://api.mistral.ai/v1/chat/completions', { method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${MISTRAL_KEY}`}, body:JSON.stringify({model:'mistral-small',messages:[{role:'user',content:prompt}],temperature:0.5,max_tokens:200}) }),
+      new Promise<never>((_,r) => setTimeout(() => r(new Error('timeout')), 8000)),
+    ]);
+    const data = await (res as Response).json();
+    return data.choices?.[0]?.message?.content?.trim() || existingSummary;
+  } catch { return existingSummary; }
 };
 
 const callMistral = async (messages: any[], maxTokens = 400) => {
@@ -325,25 +410,82 @@ const Chip = ({ label, selected, onPress }: any) => (
 );
 
 // ─── AGE PICKER ───────────────────────────────────────────────────────────────
-const ITEM_HEIGHT = 48;
-const AGES = Array.from({ length: 68 }, (_, i) => i + 13);
+// Rebuilt to avoid the old nested ScrollView spinner bug where Android/Codespaces
+// preview could trap the picker at the default value of 17.
+const MIN_AGE = 13;
+const MAX_AGE = 80;
 
 const AgePicker = ({ value, onChange }: { value: number; onChange: (n: number) => void }) => {
-  const scrollRef = useRef<ScrollView>(null);
-  const [selectedAge, setSelectedAge] = useState(value);
-  useEffect(() => { const t = setTimeout(() => { scrollRef.current?.scrollTo({ y:(value-13)*ITEM_HEIGHT, animated:false }); }, 150); return () => clearTimeout(t); }, []);
-  const handleScrollEnd = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
-    const picked = AGES[Math.max(0,Math.min(AGES.length-1,Math.round(e.nativeEvent.contentOffset.y/ITEM_HEIGHT)))];
-    Haptics.selectionAsync(); setSelectedAge(picked); onChange(picked);
+  const clampAge = (n: number) => Math.max(MIN_AGE, Math.min(MAX_AGE, n));
+  const [selectedAge, setSelectedAge] = useState(clampAge(value || 17));
+
+  useEffect(() => {
+    const safeAge = clampAge(value || 17);
+    if (safeAge !== selectedAge) setSelectedAge(safeAge);
+  }, [value]);
+
+  const updateAge = (next: number) => {
+    const safeAge = clampAge(next);
+    Haptics.selectionAsync();
+    setSelectedAge(safeAge);
+    onChange(safeAge);
   };
+
+  const quickAges = [13, 16, 17, 18, 21, 25, 30];
+
   return (
-    <View style={{ height:ITEM_HEIGHT*3, overflow:'hidden', position:'relative' }}>
-      <View pointerEvents="none" style={{ position:'absolute',top:ITEM_HEIGHT,left:16,right:16,height:ITEM_HEIGHT,backgroundColor:'rgba(77,150,255,0.12)',borderRadius:10,borderTopWidth:1,borderBottomWidth:1,borderColor:'rgba(77,150,255,0.3)',zIndex:1 }}/>
-      <View pointerEvents="none" style={{ position:'absolute',top:0,left:0,right:0,height:ITEM_HEIGHT,backgroundColor:'rgba(5,11,20,0.82)',zIndex:1 }}/>
-      <View pointerEvents="none" style={{ position:'absolute',bottom:0,left:0,right:0,height:ITEM_HEIGHT,backgroundColor:'rgba(5,11,20,0.82)',zIndex:1 }}/>
-      <ScrollView ref={scrollRef} showsVerticalScrollIndicator={false} snapToInterval={ITEM_HEIGHT} snapToAlignment="center" decelerationRate="fast" onMomentumScrollEnd={handleScrollEnd} onScrollEndDrag={handleScrollEnd} contentContainerStyle={{ paddingVertical:ITEM_HEIGHT }}>
-        {AGES.map(age => { const isSel=age===selectedAge; return <View key={age} style={{ height:ITEM_HEIGHT,justifyContent:'center',alignItems:'center' }}><Text style={{ fontSize:isSel?28:18,fontFamily:isSel?'Inter_900Black':'Inter_400Regular',color:isSel?'#FFF':'rgba(255,255,255,0.22)',letterSpacing:isSel?1:0 }}>{age}</Text></View>; })}
-      </ScrollView>
+    <View style={{ alignItems:'center', paddingVertical:8 }}>
+      <View style={{ flexDirection:'row', alignItems:'center', justifyContent:'center', gap:18 }}>
+        <TouchableOpacity
+          onPress={() => updateAge(selectedAge - 1)}
+          disabled={selectedAge <= MIN_AGE}
+          style={{
+            width:52,height:52,borderRadius:18,alignItems:'center',justifyContent:'center',
+            borderWidth:1,borderColor:selectedAge<=MIN_AGE?'rgba(255,255,255,0.06)':'rgba(77,150,255,0.35)',
+            backgroundColor:selectedAge<=MIN_AGE?'rgba(255,255,255,0.03)':'rgba(77,150,255,0.10)',
+            opacity:selectedAge<=MIN_AGE?0.45:1,
+          }}
+        >
+          <Ionicons name="remove" size={24} color={selectedAge<=MIN_AGE?C.sub:C.primary}/>
+        </TouchableOpacity>
+
+        <View style={{ minWidth:110, alignItems:'center' }}>
+          <Text style={{ color:'#FFF', fontFamily:'Inter_900Black', fontSize:46, letterSpacing:1 }}>{selectedAge}</Text>
+          <Text style={{ color:C.sub, fontFamily:'Inter_700Bold', fontSize:12, marginTop:-4 }}>YEARS OLD</Text>
+        </View>
+
+        <TouchableOpacity
+          onPress={() => updateAge(selectedAge + 1)}
+          disabled={selectedAge >= MAX_AGE}
+          style={{
+            width:52,height:52,borderRadius:18,alignItems:'center',justifyContent:'center',
+            borderWidth:1,borderColor:selectedAge>=MAX_AGE?'rgba(255,255,255,0.06)':'rgba(77,150,255,0.35)',
+            backgroundColor:selectedAge>=MAX_AGE?'rgba(255,255,255,0.03)':'rgba(77,150,255,0.10)',
+            opacity:selectedAge>=MAX_AGE?0.45:1,
+          }}
+        >
+          <Ionicons name="add" size={24} color={selectedAge>=MAX_AGE?C.sub:C.primary}/>
+        </TouchableOpacity>
+      </View>
+
+      <View style={{ flexDirection:'row', flexWrap:'wrap', justifyContent:'center', marginTop:16, paddingHorizontal:6 }}>
+        {quickAges.map(age => {
+          const isSelected = selectedAge === age;
+          return (
+            <TouchableOpacity
+              key={age}
+              onPress={() => updateAge(age)}
+              style={{
+                paddingVertical:7,paddingHorizontal:12,borderRadius:16,margin:4,borderWidth:1,
+                borderColor:isSelected?C.primary:'rgba(255,255,255,0.12)',
+                backgroundColor:isSelected?'rgba(77,150,255,0.18)':'rgba(255,255,255,0.04)',
+              }}
+            >
+              <Text style={{ color:isSelected?C.primary:C.sub, fontFamily:'Inter_700Bold', fontSize:12 }}>{age}</Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
     </View>
   );
 };
@@ -377,43 +519,254 @@ const AsteroidField = ({ tasks }: any) => {
   );
 };
 
-const PulsingOrb = ({ size=60, color=C.primary, isThinking=false, colorOverride }: any) => {
-  const scale=useRef(new Animated.Value(1)).current,opacity=useRef(new Animated.Value(0.5)).current,cAnim=useRef(new Animated.Value(0)).current;
-  useEffect(()=>{ Animated.loop(Animated.parallel([Animated.sequence([Animated.timing(scale,{toValue:1.2,duration:2000,useNativeDriver:false}),Animated.timing(scale,{toValue:1,duration:2000,useNativeDriver:false})]),Animated.sequence([Animated.timing(opacity,{toValue:0.8,duration:2000,useNativeDriver:false}),Animated.timing(opacity,{toValue:0.5,duration:2000,useNativeDriver:false})])])).start(); },[]);
-  useEffect(()=>{ Animated.timing(cAnim,{toValue:isThinking?1:0,duration:500,useNativeDriver:false}).start(); },[isThinking]);
-  const activeColor=cAnim.interpolate({inputRange:[0,1],outputRange:[colorOverride||color,C.thinking]});
+// ─── STAR FIELD ──────────────────────────────────────────────────────────────
+// Subtle, sparse, slow-flickering stars. Used as background layer on main screens.
+const STARS = Array.from({length: 55}, (_, i) => ({
+  id: i,
+  x: Math.random() * 100,
+  y: Math.random() * 100,
+  size: Math.random() < 0.7 ? 1 : Math.random() < 0.5 ? 1.5 : 2,
+  delay: Math.random() * 4000,
+  duration: 2500 + Math.random() * 3000,
+  baseOpacity: 0.15 + Math.random() * 0.35,
+}));
+
+const StarField = () => {
+  const anims = useRef(STARS.map(() => new Animated.Value(0))).current;
+
+  useEffect(() => {
+    STARS.forEach((star, i) => {
+      const flicker = () => {
+        Animated.sequence([
+          Animated.delay(star.delay),
+          Animated.timing(anims[i], { toValue: 1, duration: star.duration / 2, useNativeDriver: true }),
+          Animated.timing(anims[i], { toValue: 0, duration: star.duration / 2, useNativeDriver: true }),
+        ]).start(() => flicker());
+      };
+      flicker();
+    });
+  }, []);
+
   return (
-    <View style={{ width:size,height:size,justifyContent:'center',alignItems:'center' }}>
-      <Animated.View style={{ position:'absolute',width:size,height:size,borderRadius:size/2,backgroundColor:activeColor,opacity,transform:[{scale}] }}/>
-      <View style={{ width:size*0.4,height:size*0.4,borderRadius:size,backgroundColor:'#FFF',shadowColor:'#FFF',shadowRadius:10,shadowOpacity:0.5 }}/>
+    <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 0 }} pointerEvents="none">
+      {STARS.map((star, i) => {
+        const opacity = anims[i].interpolate({
+          inputRange: [0, 1],
+          outputRange: [star.baseOpacity * 0.4, star.baseOpacity],
+        });
+        return (
+          <Animated.View key={star.id} style={{
+            position: 'absolute',
+            left: `${star.x}%` as any,
+            top: `${star.y}%` as any,
+            width: star.size,
+            height: star.size,
+            borderRadius: star.size,
+            backgroundColor: '#FFF',
+            opacity,
+          }}/>
+        );
+      })}
+    </View>
+  );
+};
+// Top-down dot orbit. Replaces PulsingOrb everywhere.
+// isThinking=true triggers outward purple pulse rings.
+const PulsingOrb = ({ size=60, isThinking=false }: any) => {
+  const canvasRef = useRef<any>(null);
+  const frameRef  = useRef<any>(null);
+  const stateRef  = useRef({ t: 0, pulses: [] as any[], nextPulse: 0 });
+
+  useEffect(() => {
+    let canvas: any = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const w = size, h = size, cx = w / 2, cy = h / 2;
+    const TAU = Math.PI * 2;
+
+    const rings = [
+      { r: w * 0.27, dots: 8,  speed: 0.5,  dotR: w * 0.025, col: '77,150,255'  },
+      { r: w * 0.38, dots: 12, speed: -0.32, dotR: w * 0.018, col: '127,90,240' },
+      { r: w * 0.46, dots: 6,  speed: 0.2,  dotR: w * 0.013, col: '77,150,255'  },
+    ];
+
+    const draw = () => {
+      const s = stateRef.current;
+      ctx.clearRect(0, 0, w, h);
+
+      // Pulse rings when thinking
+      if (isThinking) {
+        if (s.t > s.nextPulse) {
+          s.pulses.push({ r: w * 0.12, alpha: 0.55 });
+          s.nextPulse = s.t + 2.2;
+        }
+        for (let i = s.pulses.length - 1; i >= 0; i--) {
+          const p = s.pulses[i];
+          p.r += 0.55; p.alpha -= 0.007;
+          if (p.alpha <= 0) { s.pulses.splice(i, 1); continue; }
+          ctx.beginPath();
+          ctx.arc(cx, cy, p.r, 0, TAU);
+          ctx.strokeStyle = `rgba(217,70,239,${p.alpha})`;
+          ctx.lineWidth = 1.2;
+          ctx.stroke();
+        }
+      }
+
+      // Dot rings
+      rings.forEach(ring => {
+        for (let i = 0; i < ring.dots; i++) {
+          const a = (TAU / ring.dots) * i + s.t * ring.speed;
+          const x = cx + Math.cos(a) * ring.r;
+          const y = cy + Math.sin(a) * ring.r;
+          const alpha = isThinking
+            ? 0.45 + Math.sin(s.t * 2 + i) * 0.3
+            : 0.35 + (Math.sin(a) + 1) * 0.25;
+          ctx.beginPath();
+          ctx.arc(x, y, ring.dotR, 0, TAU);
+          ctx.fillStyle = `rgba(${ring.col},${alpha})`;
+          ctx.fill();
+        }
+      });
+
+      // Core glow
+      const gc = ctx.createRadialGradient(cx, cy, 1, cx, cy, w * 0.15);
+      gc.addColorStop(0, 'rgba(255,255,255,0.95)');
+      gc.addColorStop(0.5, isThinking ? 'rgba(217,70,239,0.6)' : 'rgba(77,150,255,0.55)');
+      gc.addColorStop(1, 'rgba(77,150,255,0)');
+      ctx.beginPath();
+      ctx.arc(cx, cy, w * 0.15, 0, TAU);
+      ctx.fillStyle = gc;
+      ctx.fill();
+
+      // White core
+      ctx.beginPath();
+      ctx.arc(cx, cy, w * 0.07, 0, TAU);
+      ctx.fillStyle = '#FFF';
+      ctx.fill();
+
+      s.t += 0.013;
+      frameRef.current = requestAnimationFrame(draw);
+    };
+
+    draw();
+    return () => { if (frameRef.current) cancelAnimationFrame(frameRef.current); };
+  }, [size, isThinking]);
+
+  // React Native: use View + inline canvas via WebView workaround
+  // Since expo supports canvas via react-native-canvas or we simulate with Animated
+  // Fallback to Animated circles for React Native compatibility
+  const scale   = useRef(new Animated.Value(1)).current;
+  const opacity = useRef(new Animated.Value(0.5)).current;
+  const pulse1  = useRef(new Animated.Value(0)).current;
+  const pulse2  = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.loop(Animated.parallel([
+      Animated.sequence([Animated.timing(scale,{toValue:1.15,duration:2200,useNativeDriver:true}),Animated.timing(scale,{toValue:1,duration:2200,useNativeDriver:true})]),
+      Animated.sequence([Animated.timing(opacity,{toValue:0.75,duration:2200,useNativeDriver:true}),Animated.timing(opacity,{toValue:0.4,duration:2200,useNativeDriver:true})]),
+    ])).start();
+  }, []);
+
+  useEffect(() => {
+    if (isThinking) {
+      Animated.loop(Animated.sequence([
+        Animated.timing(pulse1,{toValue:1,duration:1400,useNativeDriver:true}),
+        Animated.timing(pulse1,{toValue:0,duration:0,useNativeDriver:true}),
+      ])).start();
+      setTimeout(() => {
+        Animated.loop(Animated.sequence([
+          Animated.timing(pulse2,{toValue:1,duration:1400,useNativeDriver:true}),
+          Animated.timing(pulse2,{toValue:0,duration:0,useNativeDriver:true}),
+        ])).start();
+      }, 700);
+    } else {
+      pulse1.stopAnimation(); pulse1.setValue(0);
+      pulse2.stopAnimation(); pulse2.setValue(0);
+    }
+  }, [isThinking]);
+
+  const pulseScale1 = pulse1.interpolate({inputRange:[0,1],outputRange:[1,2.6]});
+  const pulseAlpha1 = pulse1.interpolate({inputRange:[0,0.5,1],outputRange:[0.5,0.2,0]});
+  const pulseScale2 = pulse2.interpolate({inputRange:[0,1],outputRange:[1,2.6]});
+  const pulseAlpha2 = pulse2.interpolate({inputRange:[0,0.5,1],outputRange:[0.5,0.2,0]});
+
+  const coreColor = isThinking ? C.thinking : C.primary;
+
+  // Dot ring positions (static approximation — rotates via scale pulse)
+  const dots8  = Array.from({length:8},  (_,i) => i);
+  const dots12 = Array.from({length:12}, (_,i) => i);
+  const dots6  = Array.from({length:6},  (_,i) => i);
+  const r1 = size * 0.27, r2 = size * 0.38, r3 = size * 0.46;
+
+  return (
+    <View style={{ width:size, height:size, justifyContent:'center', alignItems:'center' }}>
+      {/* Thinking pulse rings */}
+      {isThinking && (
+        <>
+          <Animated.View style={{ position:'absolute', width:size*0.3, height:size*0.3, borderRadius:size, borderWidth:1.2, borderColor:C.thinking, opacity:pulseAlpha1, transform:[{scale:pulseScale1}] }}/>
+          <Animated.View style={{ position:'absolute', width:size*0.3, height:size*0.3, borderRadius:size, borderWidth:1.2, borderColor:C.thinking, opacity:pulseAlpha2, transform:[{scale:pulseScale2}] }}/>
+        </>
+      )}
+      {/* Dot ring 3 — outer */}
+      {dots6.map(i => {
+        const a = (Math.PI*2/6)*i;
+        return <View key={`r3${i}`} style={{ position:'absolute', width:size*0.026, height:size*0.026, borderRadius:size, backgroundColor:`rgba(77,150,255,0.35)`, left:size/2 + Math.cos(a)*r3 - size*0.013, top:size/2 + Math.sin(a)*r3 - size*0.013 }}/>;
+      })}
+      {/* Dot ring 2 — mid */}
+      {dots12.map(i => {
+        const a = (Math.PI*2/12)*i;
+        return <View key={`r2${i}`} style={{ position:'absolute', width:size*0.018, height:size*0.018, borderRadius:size, backgroundColor:`rgba(127,90,240,${i%3===0?0.65:0.35})`, left:size/2 + Math.cos(a)*r2 - size*0.009, top:size/2 + Math.sin(a)*r2 - size*0.009 }}/>;
+      })}
+      {/* Dot ring 1 — inner */}
+      {dots8.map(i => {
+        const a = (Math.PI*2/8)*i;
+        return <View key={`r1${i}`} style={{ position:'absolute', width:size*0.025, height:size*0.025, borderRadius:size, backgroundColor:`rgba(77,150,255,${i%2===0?0.75:0.45})`, left:size/2 + Math.cos(a)*r1 - size*0.0125, top:size/2 + Math.sin(a)*r1 - size*0.0125 }}/>;
+      })}
+      {/* Core glow */}
+      <Animated.View style={{ position:'absolute', width:size*0.5, height:size*0.5, borderRadius:size, backgroundColor:coreColor, opacity, transform:[{scale}] }}/>
+      {/* White core */}
+      <View style={{ width:size*0.2, height:size*0.2, borderRadius:size, backgroundColor:'#FFF' }}/>
     </View>
   );
 };
 
 const generateAibramTemplate = async (description: string, profile: any): Promise<any[]> => {
-  const prompt = `Generate a detailed task list for this goal: "${description}"
-User: age group ${profile?.ageGroup||'unknown'}, goals: ${(profile?.shortTermGoals||[]).join(', ')||'none'}, struggle: ${profile?.struggle||'none'}.
+  const dateRef = Array.from({length:30},(_,i)=>`Day${i+1}:${fmtDate(new Date(Date.now()+i*86400000))}`).join(' ');
+  const prompt = `Generate a task list for: "${description}"
+User: ${profile?.ageGroup||'unknown'}, goals: ${(profile?.shortTermGoals||[]).slice(0,3).join(', ')||'none'}, struggle: ${profile?.struggle||'none'}.
 
-RULES — follow these strictly:
-- Every task must be SPECIFIC and actionable. Bad: "study". Good: "read pages 40-60 of chapter 3 and write a summary". Bad: "work on project". Good: "build the login screen component and test it".
-- Each task must be completable in one sitting (1-3 hours max).
-- If the description mentions a timeframe (e.g. "2 weeks", "10 days"), spread tasks across that FULL timeframe. Never shorten it.
-- Match the user's age group — a student's tasks look different from a professional's.
-- Spread tasks realistically — do not put everything on day 1.
-- Aim for 8-12 tasks for a 1-week plan, 14-20 tasks for a 2-week plan, scaling accordingly.
+DATES: ${dateRef}
 
-Return ONLY a valid JSON array, no markdown, no explanation:
-[{ "text": "specific task name", "date": "today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday" }]`;
+RULES:
+- Tasks must be SPECIFIC. Not "study" but "read chapter 3 and write notes". Not "work on app" but "build the login screen".
+- If timeframe mentioned (e.g. "2 weeks", "30 days"), use dates across that FULL range.
+- Spread tasks evenly. 8-12 tasks per week scale.
+- Each task completable in one sitting.
+
+IMPORTANT: Return ONLY the JSON array. No intro text. No explanation. No markdown. Start your response with [ and end with ].
+[{"text":"specific task","date":"YYYY-MM-DD"}]`;
   try {
     const res = await Promise.race([
-      fetch('https://api.mistral.ai/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${MISTRAL_KEY}`},body:JSON.stringify({model:'mistral-small',messages:[{role:'user',content:prompt}],temperature:0.7,max_tokens:800})}),
-      new Promise<never>((_,r)=>setTimeout(()=>r(new Error('timeout')),12000)),
+      fetch('https://api.mistral.ai/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${MISTRAL_KEY}`},body:JSON.stringify({model:'mistral-small',messages:[{role:'user',content:prompt}],temperature:0.65,max_tokens:900})}),
+      new Promise<never>((_,r)=>setTimeout(()=>r(new Error('timeout')),15000)),
     ]);
     const data = await (res as Response).json();
     const raw = data.choices?.[0]?.message?.content?.trim()??'';
-    return JSON.parse(raw.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'').trim());
+    console.log('TEMPLATE RAW:', raw.substring(0, 500));
+    // Aggressive extraction — find the JSON array anywhere in the response
+    const clean = raw.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'').trim();
+    // Try direct parse first
+    try { const p=JSON.parse(clean); if(Array.isArray(p)&&p.length>0)return p; } catch {}
+    // Try extracting array with regex
+    const match = raw.match(/\[[\s\S]*\]/);
+    if (match) {
+      try { const p=JSON.parse(match[0]); if(Array.isArray(p)&&p.length>0)return p; } catch {}
+    }
+    return [];
   } catch { return []; }
 };
+const PRESET_TEMPLATES = [
+  { id:'workout', icon:'🏋️', name:'Workout Starter', description:'3x per week for 4 weeks', days:28,
     tasks:(start: Date)=>{ const t: any[]=[]; for(let w=0;w<4;w++){[1,3,5].forEach(d=>{const date=new Date(start);date.setDate(date.getDate()+w*7+d);t.push({text:'Work out',date:fmtDate(date),timeLabel:'7:00 AM'});});} return t; } },
   { id:'study', icon:'📚', name:'Exam Study Plan', description:'Daily study sessions for 2 weeks', days:14,
     tasks:(start: Date)=>Array.from({length:14},(_,i)=>{const d=new Date(start);d.setDate(d.getDate()+i);return{text:`Study session ${i+1}`,date:fmtDate(d),timeLabel:'4:00 PM'};}) },
@@ -428,6 +781,35 @@ Return ONLY a valid JSON array, no markdown, no explanation:
 ];
 
 // ─── TEMPLATES MODAL ──────────────────────────────────────────────────────────
+const generateClarifyingQuestions = async (description: string): Promise<any[]> => {
+  const prompt = `A user wants to build a task plan for: "${description}"
+
+Generate 2-3 clarifying questions that would help make the task plan more specific and personal.
+For each question decide if it's better answered with chips (multiple choice, fast) or text (open ended).
+Use chips for: skill level, time available, frequency, experience.
+Use text for: specific targets, preferences, constraints, context.
+
+Return ONLY valid JSON array:
+[
+  {"question":"How much time can you commit per day?","type":"chips","options":["15 min","30 min","1 hour","2+ hours"]},
+  {"question":"What specific outcome are you working toward?","type":"text","options":[]}
+]
+No markdown. Start with [.`;
+  try {
+    const res = await Promise.race([
+      fetch('https://api.mistral.ai/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${MISTRAL_KEY}`},body:JSON.stringify({model:'mistral-small',messages:[{role:'user',content:prompt}],temperature:0.7,max_tokens:400})}),
+      new Promise<never>((_,r)=>setTimeout(()=>r(new Error('timeout')),8000)),
+    ]);
+    const data = await (res as Response).json();
+    const raw = data.choices?.[0]?.message?.content?.trim()??'';
+    const clean = raw.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'').trim();
+    try { const p=JSON.parse(clean); if(Array.isArray(p)&&p.length>0)return p; } catch {}
+    const match = raw.match(/\[[\s\S]*\]/);
+    if(match){ try { const p=JSON.parse(match[0]); if(Array.isArray(p))return p; } catch {} }
+    return [];
+  } catch { return []; }
+};
+
 const TemplatesModal = ({ visible, onClose, onAddTasks, profile }: any) => {
   const [activeTab,setActiveTab]=useState<'presets'|'aibram'>('presets');
   const [startDate,setStartDate]=useState(today());
@@ -436,6 +818,11 @@ const TemplatesModal = ({ visible, onClose, onAddTasks, profile }: any) => {
   const [aiLoading,setAiLoading]=useState(false);
   const [selectedPre,setSelectedPre]=useState<string|null>(null);
   const [previewTasks,setPreviewTasks]=useState<any[]>([]);
+  // Clarifying questions state
+  const [clarifyStep,setClarifyStep]=useState<'input'|'questions'|'results'>('input');
+  const [clarifyLoading,setClarifyLoading]=useState(false);
+  const [questions,setQuestions]=useState<any[]>([]);
+  const [answers,setAnswers]=useState<Record<number,string>>({});
 
   const handlePresetSelect=(t: any)=>{
     setSelectedPre(t.id);
@@ -443,35 +830,55 @@ const TemplatesModal = ({ visible, onClose, onAddTasks, profile }: any) => {
     setPreviewTasks(t.tasks(start).map((pt: any,i: number)=>({...pt,id:Date.now().toString()+i,completed:false,subtasks:[],selected:true})));
   };
 
-  const handleGenerate=async()=>{
+  const handleAskAibram=async()=>{
     if(!aiPrompt.trim())return;
+    setClarifyLoading(true);
+    const qs=await generateClarifyingQuestions(aiPrompt);
+    if(qs.length>0){setQuestions(qs);setAnswers({});setClarifyStep('questions');}
+    else{await handleGenerate();}
+    setClarifyLoading(false);
+  };
+
+  const handleGenerate=async()=>{
     setAiLoading(true);
-    const raw=await generateAibramTemplate(aiPrompt,profile);
-    setAiTasks(raw.map((t: any,i: number)=>({id:Date.now().toString()+i,text:t.text,date:suggestedDateToIso(t.date),completed:false,subtasks:[],timeLabel:null,selected:true})));
+    setClarifyStep('results');
+    try {
+      // Build enriched description with answers
+      const answerContext = questions.length>0
+        ? '\n\nUser clarifications:\n' + questions.map((q: any,i: number)=>answers[i]?`- ${q.question}: ${answers[i]}`:'').filter(Boolean).join('\n')
+        : '';
+      const raw=await generateAibramTemplate(aiPrompt+answerContext,profile);
+      if(raw.length===0){Alert.alert('Try again','Aibram had trouble generating tasks. Try being more specific.');setAiLoading(false);setClarifyStep('questions');return;}
+      setAiTasks(raw.map((t: any,i: number)=>({id:Date.now().toString()+i,text:t.text,date:t.date&&/^\d{4}-\d{2}-\d{2}$/.test(t.date)?t.date:suggestedDateToIso(t.date||'today'),completed:false,subtasks:[],timeLabel:null,selected:true})));
+    } catch(e){Alert.alert('Error','Something went wrong. Please try again.');setClarifyStep('questions');}
     setAiLoading(false);
   };
 
   const handleAdd=()=>{
     const tasks=activeTab==='presets'?previewTasks.filter((t: any)=>t.selected):aiTasks.filter((t: any)=>t.selected);
     onAddTasks(tasks);onClose();
+    // Reset
+    setClarifyStep('input');setAiPrompt('');setAiTasks([]);setQuestions([]);setAnswers({});
   };
+
+  const resetAibram=()=>{setClarifyStep('input');setAiTasks([]);setQuestions([]);setAnswers({});};
 
   return (
     <Modal visible={visible} animationType="slide" transparent>
       <View style={S.overlay}>
-        <View style={[S.modalBox,{maxHeight:'85%'}]}>
+        <View style={[S.modalBox,{maxHeight:'88%'}]}>
           <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
             <Text style={S.modalTitle}>Task Templates</Text>
-            <TouchableOpacity onPress={onClose}><Ionicons name="close" size={22} color={C.sub}/></TouchableOpacity>
+            <TouchableOpacity onPress={()=>{onClose();resetAibram();}}><Ionicons name="close" size={22} color={C.sub}/></TouchableOpacity>
           </View>
           <View style={{flexDirection:'row',backgroundColor:'rgba(255,255,255,0.05)',borderRadius:10,padding:3,marginBottom:16}}>
             {(['presets','aibram'] as const).map(tab=>(
-              <TouchableOpacity key={tab} onPress={()=>setActiveTab(tab)} style={{flex:1,paddingVertical:8,alignItems:'center',borderRadius:8,backgroundColor:activeTab===tab?C.primary:'transparent'}}>
+              <TouchableOpacity key={tab} onPress={()=>{setActiveTab(tab);resetAibram();}} style={{flex:1,paddingVertical:8,alignItems:'center',borderRadius:8,backgroundColor:activeTab===tab?C.primary:'transparent'}}>
                 <Text style={{color:activeTab===tab?'#050B14':C.sub,fontFamily:'Inter_700Bold',fontSize:13}}>{tab==='presets'?'Presets':'Ask Aibram'}</Text>
               </TouchableOpacity>
             ))}
           </View>
-          <ScrollView showsVerticalScrollIndicator={false} style={{maxHeight:400}}>
+          <ScrollView showsVerticalScrollIndicator={false} style={{maxHeight:420}} keyboardShouldPersistTaps="handled">
             {activeTab==='presets'?(
               <View>
                 <Text style={[S.sectionLabel,{marginBottom:8}]}>START DATE</Text>
@@ -510,29 +917,91 @@ const TemplatesModal = ({ visible, onClose, onAddTasks, profile }: any) => {
               </View>
             ):(
               <View>
-                <Text style={{color:C.sub,fontSize:13,marginBottom:12,lineHeight:20}}>Describe what you want to achieve and Aibram will build a task list for you.</Text>
-                <View style={S.customRow}>
-                  <TextInput style={[S.customInput,{paddingVertical:12}]} value={aiPrompt} onChangeText={setAiPrompt} placeholder="e.g. I want to start running 3x a week..." placeholderTextColor={C.sub} multiline/>
+                {/* STEP 1 — Input */}
+                <Text style={{color:C.sub,fontSize:13,marginBottom:10,lineHeight:20}}>
+                  {clarifyStep==='input'?'Describe your goal and Aibram will ask a few questions to build a specific plan for you.':
+                   clarifyStep==='questions'?`Got it. A few quick questions to make this plan actually work for you:`:
+                   'Here\'s your personalized task plan:'}
+                </Text>
+
+                {/* Goal input — always visible */}
+                <View style={[S.customRow,{marginBottom:10}]}>
+                  <TextInput
+                    style={[S.customInput,{paddingVertical:12}]}
+                    value={aiPrompt}
+                    onChangeText={t=>{setAiPrompt(t);if(clarifyStep!=='input')resetAibram();}}
+                    placeholder="e.g. I want to get better at guitar over 2 months..."
+                    placeholderTextColor={C.sub}
+                    multiline
+                    editable={clarifyStep==='input'}
+                  />
                 </View>
-                <TouchableOpacity style={[S.primaryBtn,{marginTop:12,opacity:aiLoading||!aiPrompt.trim()?0.6:1}]} onPress={handleGenerate} disabled={aiLoading||!aiPrompt.trim()}>
-                  {aiLoading?<ActivityIndicator color={C.bg}/>:<Text style={S.btnTxt}>Generate tasks →</Text>}
-                </TouchableOpacity>
-                {aiTasks.length>0&&(
-                  <View style={{marginTop:8}}>
-                    <Text style={[S.sectionLabel,{marginBottom:8}]}>GENERATED — tap to toggle</Text>
+
+                {/* STEP 1 — Ask button */}
+                {clarifyStep==='input'&&(
+                  <TouchableOpacity style={[S.primaryBtn,{opacity:clarifyLoading||!aiPrompt.trim()?0.6:1}]} onPress={handleAskAibram} disabled={clarifyLoading||!aiPrompt.trim()}>
+                    {clarifyLoading?<ActivityIndicator color={C.bg}/>:<Text style={S.btnTxt}>Ask Aibram →</Text>}
+                  </TouchableOpacity>
+                )}
+
+                {/* STEP 2 — Clarifying questions */}
+                {clarifyStep==='questions'&&questions.map((q: any,qi: number)=>(
+                  <View key={qi} style={{marginBottom:16}}>
+                    <Text style={{color:'#FFF',fontSize:13,fontFamily:'Inter_700Bold',marginBottom:8}}>{q.question}</Text>
+                    {q.type==='chips'?(
+                      <View style={{flexDirection:'row',flexWrap:'wrap',gap:8}}>
+                        {(q.options||[]).map((opt: string)=>(
+                          <TouchableOpacity key={opt} onPress={()=>{Haptics.selectionAsync();setAnswers(p=>({...p,[qi]:opt}));}} style={{paddingHorizontal:14,paddingVertical:8,borderRadius:20,borderWidth:1.5,borderColor:answers[qi]===opt?C.primary:'rgba(255,255,255,0.12)',backgroundColor:answers[qi]===opt?'rgba(77,150,255,0.15)':'rgba(255,255,255,0.04)'}}>
+                            <Text style={{fontSize:13,color:answers[qi]===opt?C.primary:C.sub,fontFamily:'Inter_700Bold'}}>{opt}</Text>
+                          </TouchableOpacity>
+                        ))}
+                      </View>
+                    ):(
+                      <TextInput style={{backgroundColor:'rgba(255,255,255,0.05)',borderWidth:1,borderColor:'rgba(255,255,255,0.1)',borderRadius:10,padding:10,color:'#FFF',fontSize:13}} placeholder="Type your answer..." placeholderTextColor={C.sub} value={answers[qi]||''} onChangeText={t=>setAnswers(p=>({...p,[qi]:t}))} returnKeyType="done"/>
+                    )}
+                  </View>
+                ))}
+
+                {clarifyStep==='questions'&&(
+                  <View style={{flexDirection:'row',gap:8,marginTop:4}}>
+                    <TouchableOpacity style={[S.primaryBtn,{flex:1,marginBottom:0,opacity:aiLoading?0.6:1}]} onPress={handleGenerate} disabled={aiLoading}>
+                      {aiLoading?<ActivityIndicator color={C.bg}/>:<Text style={S.btnTxt}>Generate my plan →</Text>}
+                    </TouchableOpacity>
+                    <TouchableOpacity onPress={resetAibram} style={{paddingHorizontal:12,paddingVertical:14,borderRadius:12,borderWidth:1,borderColor:'rgba(255,255,255,0.1)',justifyContent:'center'}}>
+                      <Ionicons name="refresh-outline" size={18} color={C.sub}/>
+                    </TouchableOpacity>
+                  </View>
+                )}
+
+                {/* STEP 3 — Generated tasks */}
+                {clarifyStep==='results'&&aiTasks.length>0&&(
+                  <View style={{marginTop:4}}>
+                    <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+                      <Text style={S.sectionLabel}>{aiTasks.length} TASKS — tap to toggle</Text>
+                      <TouchableOpacity onPress={resetAibram}><Text style={{color:C.primary,fontSize:12}}>Start over</Text></TouchableOpacity>
+                    </View>
                     {aiTasks.map((t: any,i: number)=>(
-                      <TouchableOpacity key={i} onPress={()=>setAiTasks(p=>p.map((pt,pi)=>pi===i?{...pt,selected:!pt.selected}:pt))} style={{flexDirection:'row',alignItems:'center',paddingVertical:8,gap:8}}>
+                      <TouchableOpacity key={i} onPress={()=>setAiTasks(p=>p.map((pt,pi)=>pi===i?{...pt,selected:!pt.selected}:pt))} style={{flexDirection:'row',alignItems:'center',paddingVertical:8,gap:8,borderBottomWidth:1,borderBottomColor:'rgba(255,255,255,0.05)'}}>
                         <Ionicons name={t.selected?'checkbox':'square-outline'} size={18} color={t.selected?C.primary:C.sub}/>
-                        <Text style={{color:t.selected?C.text:C.sub,fontSize:13,flex:1}}>{t.text}</Text>
-                        <Text style={{color:C.sub,fontSize:11}}>{t.date}</Text>
+                        <View style={{flex:1}}>
+                          <Text style={{color:t.selected?C.text:C.sub,fontSize:13}}>{t.text}</Text>
+                          <Text style={{color:C.sub,fontSize:11,marginTop:2}}>{t.date}</Text>
+                        </View>
                       </TouchableOpacity>
                     ))}
+                  </View>
+                )}
+
+                {clarifyStep==='results'&&aiLoading&&(
+                  <View style={{alignItems:'center',paddingVertical:30}}>
+                    <ActivityIndicator color={C.primary}/>
+                    <Text style={{color:C.sub,marginTop:12,fontSize:13}}>Building your personalized plan...</Text>
                   </View>
                 )}
               </View>
             )}
           </ScrollView>
-          {((activeTab==='presets'&&previewTasks.some((t: any)=>t.selected))||(activeTab==='aibram'&&aiTasks.some((t: any)=>t.selected)))&&(
+          {((activeTab==='presets'&&previewTasks.some((t: any)=>t.selected))||(activeTab==='aibram'&&clarifyStep==='results'&&aiTasks.some((t: any)=>t.selected)))&&(
             <TouchableOpacity style={[S.primaryBtn,{marginTop:16,marginBottom:0}]} onPress={handleAdd}>
               <Text style={S.btnTxt}>Add {activeTab==='presets'?previewTasks.filter((t: any)=>t.selected).length:aiTasks.filter((t: any)=>t.selected).length} tasks →</Text>
             </TouchableOpacity>
@@ -792,9 +1261,9 @@ const DailyBriefingScreen = ({ name, profile, todayTasks, streak, yesterdayCompl
   const [briefing,setBriefing]=useState(''),[loading,setLoading]=useState(true),[energy,setEnergy]=useState<string|null>(null),[showVibe,setShowVibe]=useState(false);
   useEffect(()=>{ generateDailyBriefing(name,profile,todayTasks,streak,yesterdayCompleted).then(t=>{setBriefing(t);setLoading(false);}); },[]);
   const ENERGY_OPTIONS = [
-    {key:'Recharging', icon:'battery-half-outline', desc:'Low energy — keep it light today'},
-    {key:'Steady',     icon:'flash-outline',         desc:'Normal day — let\'s get things done'},
-    {key:'Locked in',  icon:'flame-outline',         desc:'High energy — push harder today'},
+    {key:'Recharging', icon:'battery-half-outline', desc:'Keep it light today',       activeColor:'#F59E0B', activeBg:'rgba(245,158,11,0.1)',  activeBorder:'rgba(245,158,11,0.4)' },
+    {key:'Steady',     icon:'flash-outline',         desc:"Normal day — let's go",    activeColor:C.primary,activeBg:'rgba(77,150,255,0.1)',   activeBorder:'rgba(77,150,255,0.4)'  },
+    {key:'Locked in',  icon:'flame-outline',         desc:'Push harder today',        activeColor:'#FF8906', activeBg:'rgba(255,137,6,0.1)',   activeBorder:'rgba(255,137,6,0.4)'   },
   ];
   const handleDone = () => {
     if (!showVibe) { setShowVibe(true); return; }
@@ -812,16 +1281,18 @@ const DailyBriefingScreen = ({ name, profile, todayTasks, streak, yesterdayCompl
         <View style={{width:'100%'}}>
           <Text style={{color:'#FFF',fontFamily:'Inter_900Black',fontSize:22,textAlign:'center',marginBottom:6}}>How's your energy?</Text>
           <Text style={{color:C.sub,fontSize:14,textAlign:'center',marginBottom:24}}>Aibram adapts to how you're showing up today.</Text>
-          {ENERGY_OPTIONS.map(opt=>(
-            <TouchableOpacity key={opt.key} onPress={()=>{Haptics.selectionAsync();setEnergy(opt.key);}} style={{flexDirection:'row',alignItems:'center',gap:14,padding:14,borderRadius:14,borderWidth:1.5,marginBottom:10,borderColor:energy===opt.key?C.primary:'rgba(255,255,255,0.1)',backgroundColor:energy===opt.key?'rgba(77,150,255,0.1)':'rgba(255,255,255,0.03)'}}>
-              <Ionicons name={opt.icon as any} size={22} color={energy===opt.key?C.primary:C.sub}/>
+          {ENERGY_OPTIONS.map(opt=>{
+            const isSelected=energy===opt.key;
+            return(
+            <TouchableOpacity key={opt.key} onPress={()=>{Haptics.selectionAsync();setEnergy(opt.key);}} style={{flexDirection:'row',alignItems:'center',gap:14,padding:14,borderRadius:14,borderWidth:1.5,marginBottom:10,borderColor:isSelected?opt.activeBorder:'rgba(255,255,255,0.1)',backgroundColor:isSelected?opt.activeBg:'rgba(255,255,255,0.03)'}}>
+              <Ionicons name={opt.icon as any} size={22} color={isSelected?opt.activeColor:C.sub}/>
               <View style={{flex:1}}>
-                <Text style={{color:energy===opt.key?C.primary:'#FFF',fontFamily:'Inter_700Bold',fontSize:15}}>{opt.key}</Text>
+                <Text style={{color:isSelected?opt.activeColor:'#FFF',fontFamily:'Inter_700Bold',fontSize:15}}>{opt.key}</Text>
                 <Text style={{color:C.sub,fontSize:12,marginTop:2}}>{opt.desc}</Text>
               </View>
-              {energy===opt.key&&<Ionicons name="checkmark-circle" size={20} color={C.primary}/>}
+              {isSelected&&<Ionicons name="checkmark-circle" size={20} color={opt.activeColor}/>}
             </TouchableOpacity>
-          ))}
+          )})}
           <TouchableOpacity style={[S.primaryBtn,{marginTop:12,opacity:energy?1:0.5}]} onPress={()=>{if(energy)onDone(energy);}} disabled={!energy}>
             <Text style={S.btnTxt}>Let's go →</Text>
           </TouchableOpacity>
@@ -1109,8 +1580,17 @@ const SpaceScreen = ({ goals, setGoals, profile, setPendingMsg, setTab }: any) =
       <ScrollView contentContainerStyle={{paddingHorizontal:20,paddingBottom:kbVis?20:100}} keyboardShouldPersistTaps="handled">
         {filtered.length===0&&(
           <Text style={{color:C.sub,textAlign:'center',marginTop:40,opacity:0.6,lineHeight:22}}>
-            {filter==='All'?'Nothing here yet.\nThrow your first idea in above.':
-             `No ${filter.toLowerCase()} ideas yet.`}
+            {filter==='All'?(
+              <View style={{alignItems:'center',paddingVertical:40,gap:10}}>
+                <View style={{width:48,height:48,borderRadius:24,backgroundColor:'rgba(127,90,240,0.1)',borderWidth:1,borderColor:'rgba(127,90,240,0.2)',justifyContent:'center',alignItems:'center'}}>
+                  <Ionicons name="telescope-outline" size={22} color={C.accent}/>
+                </View>
+                <Text style={{color:'#FFF',fontSize:14,fontFamily:'Inter_700Bold'}}>Your space is empty</Text>
+                <Text style={{color:C.sub,fontSize:12,textAlign:'center',lineHeight:18}}>Throw any idea in above.{'\n'}No structure required.</Text>
+              </View>
+            ):(
+              <Text style={{color:C.sub,textAlign:'center',marginTop:40,opacity:0.6}}>{`No ${filter.toLowerCase()} ideas yet.`}</Text>
+            )}
           </Text>
         )}
 
@@ -1437,7 +1917,7 @@ const FocusScreen = ({ addXp, setMsg, nav, goals }: any) => {
 
           <TouchableOpacity onPress={mode==='focus'?startFocus:startMindfulness} style={{backgroundColor:mode==='mindfulness'?C.accent:C.primary,paddingVertical:16,borderRadius:30,alignItems:'center'}}>
             <Text style={{color:mode==='mindfulness'?'#FFF':'#000',fontFamily:'Inter_700Bold',fontSize:16}}>
-              {mode==='focus'?'Locked in. Let\'s go.':'Begin session'}
+              {mode==='focus'?'Let\'s go.':'Begin session'}
             </Text>
           </TouchableOpacity>
         </View>
@@ -1450,18 +1930,123 @@ const FocusScreen = ({ addXp, setMsg, nav, goals }: any) => {
   );
 };
 
+const stripLiteMarkdown = (value: any) => String(value ?? '')
+  .replace(/\*\*/g, '')
+  .replace(/^#{1,6}\s*/gm, '')
+  .replace(/`/g, '')
+  .trim();
+
+const looksLikeFormulaLine = (line: string) => {
+  const t = line.trim();
+  return /[=+\-*/^()]/.test(t) && /\d|i\b|x\b|y\b/.test(t) && t.length < 90;
+};
+
+const RenderCleanLines = ({ text, paragraphStyle = S.aiParagraph }: { text: string; paragraphStyle?: any }) => {
+  const lines = stripLiteMarkdown(text).split('\n');
+  return (
+    <View>
+      {lines.map((line, index) => {
+        const trimmed = stripLiteMarkdown(line);
+        if (!trimmed) return <View key={index} style={{ height: 8 }}/>;
+        const isBullet = trimmed.startsWith('- ') || trimmed.startsWith('• ');
+        const isNumbered = /^\d+[.)]\s/.test(trimmed);
+        const looksLikeHeading = trimmed.length < 55 && !trimmed.endsWith('.') && (trimmed.endsWith(':') || /^[A-Z][A-Za-z0-9\s/&-]+$/.test(trimmed));
+        if (looksLikeFormulaLine(trimmed)) return <Text key={index} style={S.formulaLine}>{trimmed}</Text>;
+        if (looksLikeHeading && !isNumbered && !isBullet) return <Text key={index} style={S.aiHeading}>{trimmed.replace(/:$/, '')}</Text>;
+        if (isBullet || isNumbered) {
+          return (
+            <View key={index} style={S.aiBulletRow}>
+              <Text style={S.aiBulletDot}>{isNumbered ? (trimmed.match(/^\d+/)?.[0] || '') + '.' : '•'}</Text>
+              <Text style={paragraphStyle}>{trimmed.replace(/^[-•]\s/, '').replace(/^\d+[.)]\s/, '')}</Text>
+            </View>
+          );
+        }
+        return <Text key={index} style={paragraphStyle}>{trimmed}</Text>;
+      })}
+    </View>
+  );
+};
+
+const GuidedStepCard = ({ step, index }: { step: any; index: number }) => {
+  const isGoal = index === 1 && /goal|problem|what/i.test(step.title || '');
+  return (
+    <View style={S.stepCard}>
+      <View style={S.stepCardTop}>
+        <View style={[S.stepBadge, isGoal && { backgroundColor:'rgba(127,90,240,0.18)', borderColor:'rgba(127,90,240,0.35)' }]}>
+          <Text style={[S.stepBadgeText, isGoal && { color:C.accent }]}>{isGoal ? '◆' : index}</Text>
+        </View>
+        <Text style={S.stepTitle}>{stripLiteMarkdown(step.title || ('Step ' + index))}</Text>
+      </View>
+      <RenderCleanLines text={step.body || ''} paragraphStyle={S.stepBody}/>
+    </View>
+  );
+};
+
+const ChatMessageBlock = ({ message }: { message: any }) => {
+  const isUser = message.sender === 'user';
+
+  if (isUser) {
+    return (
+      <View style={S.userPromptWrap}>
+        <Text style={S.userPromptLabel}>You</Text>
+        <Text style={S.userPromptText}>{stripLiteMarkdown(message.text)}</Text>
+      </View>
+    );
+  }
+
+  const isGuided = message.responseStyle === 'guided' && Array.isArray(message.steps) && message.steps.length > 0;
+
+  return (
+    <View style={S.aiResponseWrap}>
+      <View style={S.aiResponseHead}>
+        <View style={S.aiMiniMark}>
+          <View style={S.aiMiniCore}/>
+        </View>
+        <Text style={S.aiName}>Aibram</Text>
+        {isGuided && <Text style={S.guidedPill}>Guided Response</Text>}
+      </View>
+      <View style={S.aiResponseBody}>
+        {!!message.text && <RenderCleanLines text={message.text}/>}
+        {isGuided && (
+          <View style={S.guidedStack}>
+            {message.steps.map((step: any, i: number) => <GuidedStepCard key={i} step={step} index={i + 1}/>)}
+            {!!message.finalAnswer && (
+              <View style={S.finalCard}>
+                <View style={S.finalCardTop}>
+                  <Ionicons name="checkmark-circle" size={18} color={C.success}/>
+                  <Text style={S.finalTitle}>Final Result</Text>
+                </View>
+                <RenderCleanLines text={message.finalAnswer} paragraphStyle={S.finalBody}/>
+              </View>
+            )}
+          </View>
+        )}
+      </View>
+    </View>
+  );
+};
+
 // ─── AIBRAM SCREEN ────────────────────────────────────────────────────────────
 const AibramScreen = ({ userData, addXp, pendingMsg, clearPending, goals, setGoals, xp, nav, profile, energy }: any) => {
   const scrollRef=useRef<any>();
-  const [msgs,setMsgs]=useState<any[]>([]),[input,setInput]=useState(''),[thinking,setThinking]=useState(false),[kbVis,setKbVis]=useState(false),[loaded,setLoaded]=useState(false),[ideaContext,setIdeaContext]=useState<string|null>(null);
+  const [msgs,setMsgs]=useState<any[]>([]),[input,setInput]=useState(''),[thinking,setThinking]=useState(false),[kbVis,setKbVis]=useState(false),[loaded,setLoaded]=useState(false),[ideaContext,setIdeaContext]=useState<string|null>(null),[summary,setSummary]=useState<string>('');
   const dot=useRef(new Animated.Value(0)).current,rank=getRank(xp);
 
   useEffect(()=>{if(thinking){Animated.loop(Animated.sequence([Animated.timing(dot,{toValue:1,duration:500,useNativeDriver:true}),Animated.timing(dot,{toValue:0,duration:500,useNativeDriver:true})])).start();}else{dot.stopAnimation();dot.setValue(0);}},[thinking]);
-  useEffect(()=>{loadFromFirestore('chat_history').then(saved=>{setMsgs(saved??[{id:'1',sender:'aibram',text:`Hey ${userData.name}. What are we working on today?`}]);setLoaded(true);}).catch(()=>setLoaded(true));},[]);
+
+  useEffect(()=>{
+    Promise.all([
+      loadFromFirestore('chat_history'),
+      loadFromFirestore('aibram_summary'),
+    ]).then(([saved, savedSummary])=>{
+      setMsgs(saved??[{id:'1',sender:'aibram',text:`Hey ${userData.name}. What are we working on today?`}]);
+      if(savedSummary) setSummary(savedSummary);
+      setLoaded(true);
+    }).catch(()=>setLoaded(true));
+  },[]);
 
   useEffect(()=>{
     if(loaded&&pendingMsg){
-      // Check for idea context
       const ideaMatch=pendingMsg.match(/^\[IDEA_CONTEXT:(.+)\]$/);
       if(ideaMatch){
         setIdeaContext(ideaMatch[1]);
@@ -1475,7 +2060,16 @@ const AibramScreen = ({ userData, addXp, pendingMsg, clearPending, goals, setGoa
 
   useEffect(()=>{const s=Keyboard.addListener(Platform.OS==='ios'?'keyboardWillShow':'keyboardDidShow',()=>setKbVis(true));const h=Keyboard.addListener(Platform.OS==='ios'?'keyboardWillHide':'keyboardDidHide',()=>setKbVis(false));return()=>{s.remove();h.remove();};},[]);
 
-  const clearChat=()=>Alert.alert('Clear Chat?','Deletes all conversation history.',[{text:'Cancel',style:'cancel'},{text:'Clear',style:'destructive',onPress:async()=>{setIdeaContext(null);const r=[{id:Date.now().toString(),sender:'aibram',text:"Fresh start. What are we tackling?"}];setMsgs(r);await saveToFirestore('chat_history',r);}}]);
+  const clearChat=()=>{
+    const confirmed = typeof window !== 'undefined'
+      ? window.confirm("Clear all messages and Aibram's memory? This cannot be undone.")
+      : true;
+    if(!confirmed) return;
+    setIdeaContext(null);setSummary('');
+    const r=[{id:Date.now().toString(),sender:'aibram',text:"Fresh start. What are we tackling?"}];
+    setMsgs(r);
+    Promise.all([saveToFirestore('chat_history',r),saveToFirestore('aibram_summary',null)]);
+  };
 
   const send=async(override: string|null=null,ideaCtx: string|null=null)=>{
     const txt=(override||input).trim();if(!txt)return;
@@ -1486,64 +2080,124 @@ const AibramScreen = ({ userData, addXp, pendingMsg, clearPending, goals, setGoa
     addXp(10);setInput('');
     const snap=msgs,withU=[...snap,{id:Date.now().toString(),sender:'user',text:txt}];
     setMsgs(withU);await saveToFirestore('chat_history',withU);setThinking(true);
-    const messages=buildMessages(userData.name,rank.name,xp,goals,snap,txt,profile,energy||'Steady',ideaCtx||ideaContext||undefined);
+    const messages=buildMessages(userData.name,rank.name,xp,goals,snap,txt,profile,energy||'Steady',ideaCtx||ideaContext||undefined,summary);
     const [result]=await Promise.all([callMistral(messages),new Promise(r=>setTimeout(r,500+Math.random()*700))]);
+
     if(result.action?.type==='add_task'&&result.action.task){const nt={id:Date.now().toString(),text:result.action.task,completed:false,date:today(),timeLabel:result.action.time??null,subtasks:[]};const ng=[...goals,nt];setGoals(ng);await saveToFirestore('goals',ng);if(nt.timeLabel)await scheduleTaskNotification(nt);}
     if(result.action?.type==='add_subtasks'&&result.action.parentTaskId&&result.action.subtasks){const updated=goals.map((g: any)=>{if(g.id!==result.action.parentTaskId)return g;const newSubs=result.action.subtasks.map((t: string,i: number)=>({id:`${g.id}-ai-${Date.now()}-${i}`,text:t,completed:false}));return{...g,subtasks:[...(g.subtasks||[]),...newSubs]};});setGoals(updated);await saveToFirestore('goals',updated);}
     if(result.action?.type==='focus'){setTimeout(()=>nav('Focus'),1000);}
     if(result.action?.type==='schedule'){setTimeout(()=>nav('Goals'),1000);}
-    const final=[...withU,{id:(Date.now()+2).toString(),sender:'aibram',text:result.reply}];
+    if(result.action?.type==='delete_task'&&result.action.taskKeyword){const kw=result.action.taskKeyword.toLowerCase();const updated=goals.filter((g: any)=>!g.text.toLowerCase().includes(kw));setGoals(updated);await saveToFirestore('goals',updated);}
+    if(result.action?.type==='complete_today'){const updated=goals.map((g: any)=>g.date===today()?{...g,completed:true}:g);setGoals(updated);await saveToFirestore('goals',updated);}
+    if(result.action?.type==='reschedule_task'&&result.action.taskKeyword&&result.action.newDate){const kw=result.action.taskKeyword.toLowerCase();const updated=goals.map((g: any)=>g.text.toLowerCase().includes(kw)?{...g,date:result.action.newDate}:g);setGoals(updated);await saveToFirestore('goals',updated);}
+    if(result.action?.type==='clear_day'&&result.action.targetDate){const updated=goals.filter((g: any)=>g.date!==result.action.targetDate);setGoals(updated);await saveToFirestore('goals',updated);}
+
+    const botReply = result?.reply || rand(FALLBACKS);
+    const final = [
+      ...withU,
+      {
+        id: (Date.now() + 2).toString(),
+        sender: 'aibram',
+        text: botReply,
+        responseStyle: result?.responseStyle ?? null,
+        steps: Array.isArray(result?.steps) ? result.steps : [],
+        finalAnswer: result?.finalAnswer ?? '',
+      },
+    ];
     setMsgs(final);await saveToFirestore('chat_history',final);setThinking(false);
+
+    if(final.length>0&&final.length%20===0){
+      const toSummarize=final.slice(Math.max(0,final.length-40),final.length-20);
+      if(toSummarize.length>0){
+        generateConversationSummary(toSummarize,summary).then(async(newSummary)=>{
+          setSummary(newSummary);
+          await saveToFirestore('aibram_summary',newSummary);
+        });
+      }
+    }
   };
 
   return (
     <KeyboardAvoidingView style={S.screen} behavior={Platform.OS==='ios'?'padding':'height'}>
-      <View style={{alignItems:'center',paddingTop:60,paddingBottom:10}}>
-        <View style={{flexDirection:'row',alignItems:'center',justifyContent:'center',width:'100%'}}>
-          <PulsingOrb size={60} color={C.primary} isThinking={thinking}/>
-          <TouchableOpacity onPress={clearChat} style={{position:'absolute',right:20,top:10,padding:10}}><Ionicons name="trash-outline" size={20} color={C.sub}/></TouchableOpacity>
+      <View style={S.aiChatHeader}>
+        <View style={{flexDirection:'row',alignItems:'center',gap:12,flex:1}}>
+          <PulsingOrb size={38} isThinking={thinking}/>
+          <View style={{flex:1}}>
+            <Text style={S.aiChatTitle}>Aibram</Text>
+            <View style={{flexDirection:'row',alignItems:'center',gap:6,marginTop:2}}>
+              <View style={[S.statusDot,{backgroundColor:thinking?C.thinking:C.success}]}/>
+              <Text style={S.aiChatStatus}>{thinking?'Thinking...':'Online · Ready to help'}</Text>
+              {energy&&<Text style={S.aiEnergyPill}>{energy==='Recharging'?'🔋':energy==='Locked in'?'🔥':'⚡'} {energy}</Text>}
+            </View>
+          </View>
         </View>
-        <Text style={{color:thinking?C.thinking:C.primary,marginTop:5,fontFamily:'Inter_700Bold',fontSize:10}}>{thinking?'AIBRAM IS THINKING...':'AIBRAM ONLINE'}</Text>
-        {energy&&<View style={{flexDirection:'row',alignItems:'center',gap:4,marginTop:4,backgroundColor:'rgba(255,255,255,0.05)',borderRadius:8,paddingHorizontal:10,paddingVertical:3}}><Text style={{fontSize:10,color:C.sub}}>{energy==='Recharging'?'🔋':energy==='Locked in'?'🔥':'⚡'}</Text><Text style={{fontSize:10,color:C.sub}}>{energy}</Text></View>}
+        <TouchableOpacity onPress={clearChat} style={S.headerIconBtn}>
+          <Ionicons name="trash-outline" size={20} color={C.sub}/>
+        </TouchableOpacity>
       </View>
 
-      <ScrollView style={{flex:1}} contentContainerStyle={{paddingHorizontal:20,paddingBottom:20}} ref={scrollRef} onContentSizeChange={()=>scrollRef.current?.scrollToEnd({animated:true})}>
-        {/* Thread context banner */}
+      <ScrollView style={{flex:1}} contentContainerStyle={S.aiChatScroll} ref={scrollRef} onContentSizeChange={()=>scrollRef.current?.scrollToEnd({animated:true})}>
         {ideaContext&&(
-          <View style={{backgroundColor:'rgba(77,150,255,0.08)',borderWidth:1,borderColor:'rgba(77,150,255,0.2)',borderRadius:12,padding:10,marginBottom:4}}>
-            <Text style={{fontSize:10,color:C.primary,marginBottom:4,letterSpacing:0.5}}>REPLYING TO YOUR IDEA</Text>
-            <Text style={{fontSize:13,color:C.text,lineHeight:18}}>"{ideaContext}"</Text>
+          <View style={S.ideaContextCard}>
+            <Text style={S.ideaContextLabel}>REPLYING TO YOUR IDEA</Text>
+            <Text style={S.ideaContextText}>"{ideaContext}"</Text>
           </View>
         )}
-        {ideaContext&&<View style={{width:2,height:12,backgroundColor:'rgba(77,150,255,0.4)',marginLeft:20,marginBottom:4,borderRadius:1}}/>}
 
-        {msgs.map((m: any)=>(<View key={m.id} style={[S.bubble,m.sender==='user'?S.userBubble:S.aiBubble]}><Text style={{color:'#FFF'}}>{m.text}</Text></View>))}
-        {thinking&&(<View style={[S.bubble,S.aiBubble,{paddingVertical:14}]}><Animated.Text style={{color:C.sub,opacity:dot.interpolate({inputRange:[0,1],outputRange:[0.3,1]})}}>Aibram is thinking...</Animated.Text></View>)}
+        {msgs.map((m: any)=><ChatMessageBlock key={m.id} message={m}/>)}
+
+        {thinking&&(
+          <View style={S.aiResponseWrap}>
+            <View style={S.aiResponseHead}>
+              <View style={S.aiMiniMark}><View style={S.aiMiniCore}/></View>
+              <Text style={S.aiName}>Aibram</Text>
+            </View>
+            <Animated.Text style={[S.aiThinkingText,{opacity:dot.interpolate({inputRange:[0,1],outputRange:[0.35,1]})}]}>Thinking through it...</Animated.Text>
+          </View>
+        )}
       </ScrollView>
 
-      <View style={[S.chatInput,{marginBottom:kbVis?10:90,backgroundColor:C.bg}]}>
-        <TextInput style={S.chatBox} value={input} onChangeText={setInput} placeholder="Message Aibram..." placeholderTextColor={C.sub} editable={!thinking}/>
-        <TouchableOpacity onPress={()=>send()} disabled={thinking}><Ionicons name="arrow-up-circle" size={40} color={thinking?C.sub:C.primary}/></TouchableOpacity>
+      <View style={[S.aiComposerWrap,{marginBottom:kbVis?10:90}]}>
+        <TextInput
+          style={S.aiComposerInput}
+          value={input}
+          onChangeText={setInput}
+          placeholder="Ask Aibram anything..."
+          placeholderTextColor={C.sub}
+          editable={!thinking}
+          multiline
+          maxLength={1200}
+        />
+        <TouchableOpacity onPress={()=>send()} disabled={thinking||!input.trim()} style={[S.aiSendBtn,{opacity:thinking||!input.trim()?0.45:1}]}>
+          <Ionicons name="arrow-up" size={20} color={C.bg}/>
+        </TouchableOpacity>
       </View>
     </KeyboardAvoidingView>
   );
 };
-
 // ─── HOME SCREEN ──────────────────────────────────────────────────────────────
 const HomeScreen = ({ nav, userData, streak, xp, goals, setMsg, aibramNote, clearNote, weeklyReview, energy }: any) => {
   const rank=getRank(xp),next=getNextRank(xp),progress=Math.min(1,(xp-rank.minXp)/(next.minXp-rank.minXp));
   const todayT=goals.filter((g: any)=>g.date===today()),activeN=goals.filter((g: any)=>!g.completed).length;
   const isSunday=new Date().getDay()===0;
+  const todayDone=todayT.filter((g: any)=>g.completed).length;
+  const todayProgress=todayT.length>0?todayDone/todayT.length:0;
+  const dateStr=new Date().toLocaleDateString('en-US',{weekday:'long',month:'short',day:'numeric'});
+  const energyColor=energy==='Recharging'?C.low:energy==='Locked in'?C.warning:C.success;
+  const energyIcon=energy==='Recharging'?'🔋':energy==='Locked in'?'🔥':'⚡';
+  const energyRGB=energy==='Recharging'?'245,158,11':energy==='Locked in'?'255,137,6':'44,182,125';
   return (
     <ScrollView style={S.screen} contentContainerStyle={S.scrollPad}>
       <View style={{marginBottom:24}}>
         <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'flex-start'}}>
           <View>
-            <Text style={{color:C.sub,fontSize:14,fontFamily:'Inter_400Regular'}}>Welcome back, {userData.name}</Text>
-            <Text style={{color:'#FFF',fontSize:17,fontFamily:'Inter_900Black',marginTop:4}}>Lock in. Aibram's got your back.</Text>
+            <Text style={{color:C.sub,fontSize:12,fontFamily:'Inter_400Regular'}}>{dateStr}</Text>
+            <Text style={{color:'#FFF',fontSize:20,fontFamily:'Inter_900Black',marginTop:3,letterSpacing:-0.4}}>
+              {energy==='Recharging'?'Take it easy today.':energy==='Locked in'?`You're locked in.`:`Good to see you, ${userData.name}.`}
+            </Text>
           </View>
-          <View style={{flexDirection:'row',alignItems:'center',gap:8}}>
-            {energy&&<View style={{backgroundColor:'rgba(255,255,255,0.06)',borderRadius:8,paddingHorizontal:8,paddingVertical:4}}><Text style={{fontSize:11,color:energy==='Recharging'?C.low:energy==='Locked in'?C.warning:C.success}}>{energy==='Recharging'?'🔋':energy==='Locked in'?'🔥':'⚡'} {energy}</Text></View>}
+          <View style={{flexDirection:'row',alignItems:'center',gap:6}}>
+            {energy&&<View style={{backgroundColor:`rgba(${energyRGB},0.12)`,borderRadius:8,paddingHorizontal:8,paddingVertical:4,borderWidth:1,borderColor:`rgba(${energyRGB},0.25)`}}><Text style={{fontSize:11,color:energyColor}}>{energyIcon} {energy}</Text></View>}
             <View style={S.streakBadge}><Ionicons name="flame" size={16} color={C.warning}/><Text style={{color:C.warning,fontWeight:'bold',marginLeft:5}}>{streak}</Text></View>
           </View>
         </View>
@@ -1562,10 +2216,25 @@ const HomeScreen = ({ nav, userData, streak, xp, goals, setMsg, aibramNote, clea
       )}
 
       <Text style={S.secTitle}>Today's Mission</Text>
-      <View style={S.missionCard}>
-        {todayT.length===0?(<TouchableOpacity onPress={()=>nav('Goals')}><Text style={{color:C.sub,textAlign:'center'}}>No tasks yet — add one in Tasks →</Text></TouchableOpacity>):(
-          <>{todayT.slice(0,3).map((g: any)=>(<View key={g.id} style={{flexDirection:'row',alignItems:'flex-start',marginBottom:10}}><Ionicons name={g.completed?'checkbox':'square-outline'} size={18} color={g.completed?C.success:C.warning} style={{marginTop:1}}/><View style={{flex:1,marginLeft:10}}><Text style={{color:C.text,fontSize:14,textDecorationLine:g.completed?'line-through':'none'}}>{g.text}</Text>{g.timeLabel&&<Text style={{color:C.primary,fontSize:11,marginTop:1}}>🕐 {g.timeLabel}</Text>}{g.subtasks?.length>0&&<Text style={{color:C.sub,fontSize:11,marginTop:1}}>{g.subtasks.filter((s: any)=>s.completed).length}/{g.subtasks.length} subtasks</Text>}</View></View>))}
-          {todayT.length>3&&<TouchableOpacity onPress={()=>nav('Goals')} style={{marginTop:4}}><Text style={{color:C.primary,fontSize:12}}>+{todayT.length-3} more →</Text></TouchableOpacity>}</>
+      <View style={[S.missionCard,{borderColor:'rgba(77,150,255,0.18)',borderWidth:1}]}>
+        {todayT.length===0?(
+          <View style={{alignItems:'center',paddingVertical:16,gap:8}}>
+            <View style={{width:36,height:36,borderRadius:18,backgroundColor:'rgba(255,255,255,0.05)',borderWidth:1,borderColor:'rgba(255,255,255,0.08)',justifyContent:'center',alignItems:'center'}}>
+              <Ionicons name="calendar-outline" size={18} color={C.sub}/>
+            </View>
+            <Text style={{color:'#FFF',fontSize:13,fontFamily:'Inter_700Bold'}}>Nothing scheduled</Text>
+            <Text style={{color:C.sub,fontSize:12,textAlign:'center',lineHeight:18}}>Add a task below or ask Aibram to plan your day.</Text>
+            <TouchableOpacity onPress={()=>nav('Goals')} style={{marginTop:4,paddingHorizontal:14,paddingVertical:7,borderRadius:20,borderWidth:1,borderColor:'rgba(77,150,255,0.3)',backgroundColor:'rgba(77,150,255,0.08)'}}><Text style={{color:C.primary,fontSize:12,fontFamily:'Inter_700Bold'}}>Add a task →</Text></TouchableOpacity>
+          </View>
+        ):(
+          <>
+            {todayT.slice(0,3).map((g: any)=>(<View key={g.id} style={{flexDirection:'row',alignItems:'flex-start',marginBottom:10}}><Ionicons name={g.completed?'checkbox':'square-outline'} size={18} color={g.completed?C.success:C.warning} style={{marginTop:1}}/><View style={{flex:1,marginLeft:10}}><Text style={{color:g.completed?C.sub:C.text,fontSize:14,textDecorationLine:g.completed?'line-through':'none'}}>{g.text}</Text>{g.timeLabel&&<Text style={{color:C.primary,fontSize:11,marginTop:1}}>🕐 {g.timeLabel}</Text>}{g.subtasks?.length>0&&<Text style={{color:C.sub,fontSize:11,marginTop:1}}>{g.subtasks.filter((s: any)=>s.completed).length}/{g.subtasks.length} subtasks</Text>}</View></View>))}
+            {todayT.length>3&&<TouchableOpacity onPress={()=>nav('Goals')} style={{marginTop:4}}><Text style={{color:C.primary,fontSize:12}}>+{todayT.length-3} more →</Text></TouchableOpacity>}
+            <View style={{height:3,backgroundColor:'rgba(255,255,255,0.08)',borderRadius:2,marginTop:8,overflow:'hidden'}}>
+              <View style={{height:3,backgroundColor:todayProgress===1?C.success:C.primary,borderRadius:2,width:`${todayProgress*100}%`}}/>
+            </View>
+            <Text style={{color:C.sub,fontSize:10,marginTop:4}}>{todayDone} of {todayT.length} done</Text>
+          </>
         )}
       </View>
 
@@ -1577,18 +2246,29 @@ const HomeScreen = ({ nav, userData, streak, xp, goals, setMsg, aibramNote, clea
       <View style={S.hangar}>
         <View style={{width:'100%',flexDirection:'row',justifyContent:'space-between',marginBottom:10}}><Text style={{color:C.gold,fontFamily:'Inter_900Black',fontSize:18,letterSpacing:1}}>{rank.name}</Text><Text style={{fontSize:10,color:C.primary,fontFamily:'Inter_700Bold'}}>{xp} / {next.minXp} XP</Text></View>
         <View style={{alignItems:'center',justifyContent:'center',height:150,width:220}}><AsteroidField tasks={goals}/><HologramShip tier={rank.tier}/></View>
-        <View style={{width:'100%',marginTop:20}}><View style={{height:6,backgroundColor:'rgba(255,255,255,0.1)',borderRadius:3}}><View style={{height:6,backgroundColor:C.primary,borderRadius:3,width:`${progress*100}%`}}/></View></View>
+        <View style={{width:'100%',marginTop:20}}><View style={{height:4,backgroundColor:'rgba(255,255,255,0.08)',borderRadius:2}}><View style={{height:4,backgroundColor:C.primary,borderRadius:2,width:`${progress*100}%`}}/></View><Text style={{color:C.sub,fontSize:10,marginTop:4}}>{rank.name} · {xp} XP</Text></View>
       </View>
 
       <Text style={S.secTitle}>Command Deck</Text>
       <View style={{flexDirection:'row',flexWrap:'wrap',justifyContent:'space-between'}}>
-        {[{tab:'Aibram',icon:'chatbubbles',color:C.primary,label:'Aibram'},{tab:'Goals',icon:'calendar',color:C.success,label:`Tasks (${activeN})`},{tab:'Focus',icon:'infinite',color:C.thinking,label:'Focus'},{tab:'Space',icon:'planet',color:C.accent,label:'Space'}].map((item: any)=>(
+        {[{tab:'Aibram',icon:'chatbubbles',color:C.primary,label:'Aibram'},{tab:'Goals',icon:'calendar',color:C.success,label:`Tasks (${activeN})`},{tab:'Focus',icon:'infinite',color:C.thinking,label:'Focus'},{tab:'Profile',icon:'person',color:C.accent,label:'Profile'}].map((item: any)=>(
           <TouchableOpacity key={item.tab} style={S.gridCard} onPress={()=>nav(item.tab)}>
             <Ionicons name={item.icon} size={28} color={item.color}/>
             <Text style={{color:'#FFF',marginTop:10,fontFamily:'Inter_700Bold'}}>{item.label}</Text>
           </TouchableOpacity>
         ))}
       </View>
+
+      <TouchableOpacity onPress={()=>nav('Space')} style={{width:'100%',backgroundColor:'rgba(127,90,240,0.08)',borderRadius:16,padding:18,borderWidth:1,borderColor:'rgba(127,90,240,0.25)',flexDirection:'row',alignItems:'center',gap:16,marginBottom:20}}>
+        <View style={{width:48,height:48,borderRadius:14,backgroundColor:'rgba(127,90,240,0.15)',justifyContent:'center',alignItems:'center'}}>
+          <Ionicons name="telescope-outline" size={24} color={C.accent}/>
+        </View>
+        <View style={{flex:1}}>
+          <Text style={{color:'#FFF',fontFamily:'Inter_900Black',fontSize:16}}>Space</Text>
+          <Text style={{color:C.sub,fontSize:12,marginTop:3}}>Dump ideas, expand them, ask Aibram</Text>
+        </View>
+        <Ionicons name="chevron-forward" size={18} color={C.accent}/>
+      </TouchableOpacity>
     </ScrollView>
   );
 };
@@ -1602,7 +2282,12 @@ const GoalsScreen = ({ goals, setGoals, addXp, profile }: any) => {
   const toggle=async(id: string)=>{Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);const g=goals.find((g: any)=>g.id===id);if(g&&!g.completed){addXp(50);Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);setFeedback(true);setTimeout(()=>setFeedback(false),2200);}await saveGoals(goals.map((g: any)=>g.id===id?{...g,completed:!g.completed}:g));};
   const toggleSubtask=async(taskId: string,subId: string)=>{Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);const updated=goals.map((g: any)=>{if(g.id!==taskId)return g;const newSubs=g.subtasks.map((s: any)=>s.id===subId?{...s,completed:!s.completed}:s);return{...g,subtasks:newSubs,completed:newSubs.every((s: any)=>s.completed)};});await saveGoals(updated);};
   const addSubtask=async(taskId: string)=>{const txt=(subtaskInputs[taskId]||'').trim();if(!txt)return;await saveGoals(goals.map((g: any)=>g.id!==taskId?g:{...g,subtasks:[...(g.subtasks||[]),{id:`${taskId}-${Date.now()}`,text:txt,completed:false}]}));setSubtaskInputs(p=>({...p,[taskId]:''}));};
-  const deleteTask=(id: string)=>Alert.alert('Delete task?',"This can't be undone.",[{text:'Cancel',style:'cancel'},{text:'Delete',style:'destructive',onPress:async()=>saveGoals(goals.filter((g: any)=>g.id!==id))}]);
+  const deleteTask=(id: string)=>{
+    const confirmed = typeof window !== 'undefined'
+      ? window.confirm("Delete this task? This can't be undone.")
+      : true;
+    if(confirmed) saveGoals(goals.filter((g: any)=>g.id!==id));
+  };
   const saveEdit=async(updated: any)=>{await saveGoals(goals.map((g: any)=>g.id===updated.id?updated:g));setEditTask(null);};
   const addGoal=async(dateOverride?: string)=>{if(!text.trim())return;const ng={id:Date.now().toString(),text:text.trim(),completed:false,date:dateOverride||selDate,timeLabel:pendTime?.label??null,subtasks:[]};await saveGoals([...goals,ng]);if(ng.timeLabel)await scheduleTaskNotification(ng);setText('');setPendTime(null);Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);Keyboard.dismiss();};
   const handleAddTemplates=async(tasks: any[])=>{const newGoals=[...goals,...tasks];await saveGoals(newGoals);Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);};
@@ -1618,8 +2303,8 @@ const GoalsScreen = ({ goals, setGoals, addXp, profile }: any) => {
             {g.timeLabel&&<Text style={{color:C.primary,fontSize:11,marginTop:2}}>🕐 {g.timeLabel}</Text>}
             {subs.length>0&&<Text style={{color:C.sub,fontSize:11,marginTop:2}}>{subDone}/{subs.length} done</Text>}
           </TouchableOpacity>
-          <TouchableOpacity onPress={()=>setEditTask(g)} style={{padding:8}} hitSlop={{top:8,bottom:8,left:8,right:8}}><Ionicons name="pencil-outline" size={16} color={C.sub}/></TouchableOpacity>
-          <TouchableOpacity onPress={()=>deleteTask(g.id)} style={{padding:8}} hitSlop={{top:8,bottom:8,left:8,right:8}}><Ionicons name="trash-outline" size={16} color={C.sub}/></TouchableOpacity>
+          <TouchableOpacity onPress={(e)=>{e.stopPropagation();setEditTask(g);}} style={{padding:10}} hitSlop={{top:12,bottom:12,left:12,right:12}}><Ionicons name="pencil-outline" size={18} color={C.sub}/></TouchableOpacity>
+          <TouchableOpacity onPress={(e)=>{e.stopPropagation();deleteTask(g.id);}} style={{padding:10}} hitSlop={{top:12,bottom:12,left:12,right:12}}><Ionicons name="trash-outline" size={18} color={C.danger}/></TouchableOpacity>
         </View>
         {expanded&&(<View style={{backgroundColor:'rgba(255,255,255,0.03)',borderBottomLeftRadius:8,borderBottomRightRadius:8,borderWidth:1,borderTopWidth:0,borderColor:'rgba(255,255,255,0.05)',paddingHorizontal:14,paddingBottom:10}}>
           {subs.map((sub: any)=>(<TouchableOpacity key={sub.id} onPress={()=>toggleSubtask(g.id,sub.id)} style={{flexDirection:'row',alignItems:'center',paddingVertical:10,borderBottomWidth:1,borderBottomColor:'rgba(255,255,255,0.04)'}}><Ionicons name={sub.completed?'checkmark-circle':'ellipse-outline'} size={18} color={sub.completed?C.success:C.sub}/><Text style={{marginLeft:10,color:sub.completed?C.sub:'#FFF',fontSize:14,textDecorationLine:sub.completed?'line-through':'none',flex:1}}>{sub.text}</Text></TouchableOpacity>))}
@@ -1724,6 +2409,10 @@ const ProfileScreen = ({ userData, xp, streak, profile, onProfileUpdate, onSignO
         {logs.length===0&&<Text style={{color:C.sub,textAlign:'center',marginTop:24,opacity:0.6}}>No entries yet. Start writing — it compounds.</Text>}
         {logs.map((e: any)=>(<View key={e.id} style={[S.logCard,{marginTop:12},editId===e.id&&{borderLeftColor:C.primary}]}><View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginBottom:6}}><Text style={{color:C.sub,fontSize:10}}>{e.date}</Text><View style={{flexDirection:'row',gap:14}}><TouchableOpacity onPress={()=>{setLog(e.text);setEditId(e.id);Haptics.selectionAsync();}} hitSlop={{top:8,bottom:8,left:8,right:8}}><Ionicons name="pencil-outline" size={15} color={C.sub}/></TouchableOpacity><TouchableOpacity onPress={()=>delLog(e.id)} hitSlop={{top:8,bottom:8,left:8,right:8}}><Ionicons name="trash-outline" size={15} color={C.danger}/></TouchableOpacity></View></View><Text style={{color:'#FFF'}}>{e.text}</Text></View>))}
         <View style={{marginTop:40,paddingTop:24,borderTopWidth:1,borderTopColor:'rgba(255,255,255,0.06)'}}>
+          <TouchableOpacity onPress={()=>Alert.alert('Clear Chat History?','This clears all messages and Aibram\'s memory of your conversations. Your account and tasks are not affected.',[{text:'Cancel',style:'cancel'},{text:'Clear',style:'destructive',onPress:async()=>{await Promise.all([saveToFirestore('chat_history',null),saveToFirestore('aibram_summary',null)]);Alert.alert('Done','Chat history cleared.');}}])} style={{flexDirection:'row',alignItems:'center',justifyContent:'center',gap:8,padding:14,borderRadius:12,borderWidth:1,borderColor:'rgba(148,163,184,0.2)',backgroundColor:'rgba(148,163,184,0.05)',marginBottom:12}}>
+            <Ionicons name="chatbubble-outline" size={16} color={C.sub}/>
+            <Text style={{color:C.sub,fontFamily:'Inter_700Bold',fontSize:14}}>Clear Chat History</Text>
+          </TouchableOpacity>
           <TouchableOpacity onPress={handleDeleteAccount} style={{flexDirection:'row',alignItems:'center',justifyContent:'center',gap:8,padding:14,borderRadius:12,borderWidth:1,borderColor:'rgba(239,69,101,0.3)',backgroundColor:'rgba(239,69,101,0.05)'}}><Ionicons name="trash-outline" size={16} color={C.danger}/><Text style={{color:C.danger,fontFamily:'Inter_700Bold',fontSize:14}}>Delete Account</Text></TouchableOpacity>
           <Text style={{color:C.sub,fontSize:11,textAlign:'center',marginTop:8,opacity:0.6}}>Permanently deletes your account and all data.</Text>
         </View>
@@ -1804,8 +2493,28 @@ export default function MainApp() {
     }catch(e){console.error(e);}
   };
 
-  const handleSignOut=()=>Alert.alert('Sign Out','Are you sure?',[{text:'Cancel',style:'cancel'},{text:'Sign Out',style:'destructive',onPress:async()=>{await signOutUser();router.replace('/login');}}]);
-  const handleDeleteAccount=async()=>{try{await deleteAccount();router.replace('/login');}catch(e: any){if(e.code==='auth/requires-recent-login'){Alert.alert('Re-authentication required','Please sign out and sign back in before deleting your account.');}else{Alert.alert('Error','Could not delete account. Please try again.');}}};
+  const handleSignOut=()=>{
+    const confirmed = typeof window !== 'undefined'
+      ? window.confirm('Sign out of AIBRAM?')
+      : true;
+    if(confirmed){ signOutUser().then(()=>router.replace('/login')).catch(console.error); }
+  };
+  const handleDeleteAccount=async()=>{
+    const confirmed = typeof window !== 'undefined'
+      ? window.confirm('Delete your account? This permanently deletes all your data and cannot be undone.')
+      : true;
+    if(!confirmed) return;
+    try{
+      await deleteAccount();
+      router.replace('/login');
+    }catch(e: any){
+      if(e.code==='auth/requires-recent-login'){
+        Alert.alert('Re-authentication required','Please sign out and sign back in before deleting your account.');
+      }else{
+        Alert.alert('Error','Could not delete account. Please try again.');
+      }
+    }
+  };
   const handleLogSaved=async(note: string)=>{setAibramNote(note);await saveToFirestore('aibram_note',note);};
   const clearNote=async()=>{setAibramNote(null);await saveToFirestore('aibram_note',null);};
 
@@ -1818,6 +2527,18 @@ export default function MainApp() {
   const handleNotificationAllow=async()=>{await requestNotificationPermission();finishOnboarding();};
   const handleNotificationSkip=()=>finishOnboarding();
   const finishOnboarding=async()=>{setOnboarded(true);setUserData({name});setProfile((prev: any)=>({...prev,onboarded:true}));try{await setDoc(doc(db,'users',uid()),{onboarded:true,lastBriefingDate:today()},{merge:true});}catch(e){console.error(e);}};
+
+  // Hooks must be declared before any conditional returns
+  const fadeAnim = useRef(new Animated.Value(1)).current;
+  const prevTab  = useRef(tab);
+
+  useEffect(() => {
+    if (prevTab.current !== tab) {
+      prevTab.current = tab;
+      fadeAnim.setValue(0);
+      Animated.timing(fadeAnim, { toValue: 1, duration: 150, useNativeDriver: true }).start();
+    }
+  }, [tab]);
 
   if(!fontsLoaded||loading)return(<View style={{flex:1,backgroundColor:C.bg,justifyContent:'center',alignItems:'center'}}><ActivityIndicator color={C.primary}/></View>);
 
@@ -1838,16 +2559,17 @@ export default function MainApp() {
   return(
     <LinearGradient colors={['#050B14','#0F172A','#1E293B']} style={{flex:1}}>
       <StatusBar barStyle="light-content"/>
-      <View style={{flex:1}}>
+      <StarField/>
+      <Animated.View style={{flex:1, opacity:fadeAnim}}>
         {tab==='Home'    &&<HomeScreen nav={setTab} userData={userData} streak={streak} xp={xp} goals={goals} setMsg={setPending} aibramNote={aibramNote} clearNote={clearNote} weeklyReview={weeklyReview} energy={energy}/>}
         {tab==='Goals'   &&<GoalsScreen goals={goals} setGoals={setGoals} addXp={addXp} profile={profile}/>}
         {tab==='Aibram'  &&<AibramScreen userData={userData} addXp={addXp} pendingMsg={pending} clearPending={()=>setPending(null)} goals={goals} setGoals={setGoals} xp={xp} nav={setTab} profile={profile} energy={energy}/>}
         {tab==='Focus'   &&<FocusScreen addXp={addXp} setMsg={setPending} nav={setTab} goals={goals}/>}
         {tab==='Space'   &&<SpaceScreen goals={goals} setGoals={setGoals} profile={profile} setPendingMsg={setPending} setTab={setTab}/>}
         {tab==='Profile' &&<ProfileScreen userData={userData} xp={xp} streak={streak} profile={profile} onProfileUpdate={(p: any)=>setProfile(p)} onSignOut={handleSignOut} onDeleteAccount={handleDeleteAccount} logs={logs} setLogs={setLogs} addXp={addXp}/>}
-      </View>
+      </Animated.View>
       <View style={S.navBar}>
-        {[{t:'Home',icon:'planet'},{t:'Goals',icon:'calendar'},{t:'Aibram',icon:'chatbubbles'},{t:'Focus',icon:'infinite'},{t:'Space',icon:'telescope-outline'}].map(({t,icon})=>(
+        {[{t:'Home',icon:'planet'},{t:'Goals',icon:'calendar'},{t:'Aibram',icon:'chatbubbles'},{t:'Focus',icon:'infinite'},{t:'Profile',icon:'person'}].map(({t,icon})=>(
           <TouchableOpacity key={t} onPress={()=>{Haptics.selectionAsync();setTab(t);}} style={{alignItems:'center'}}>
             <Ionicons name={icon as any} size={24} color={tab===t?C.primary:C.sub}/>
           </TouchableOpacity>
@@ -1869,6 +2591,19 @@ const S=StyleSheet.create({
   inputRow:{flexDirection:'row',alignItems:'center',padding:10},taskInput:{flex:1,backgroundColor:'rgba(255,255,255,0.1)',borderRadius:8,padding:10,color:'#FFF',marginRight:6},taskRow:{flexDirection:'row',alignItems:'center',padding:15,backgroundColor:'rgba(255,255,255,0.05)',borderRadius:8},goalInput:{backgroundColor:'rgba(255,255,255,0.08)',borderRadius:10,color:'#FFF',fontSize:15,paddingHorizontal:14,paddingVertical:12},
   customRow:{flexDirection:'row',alignItems:'center',backgroundColor:'rgba(255,255,255,0.04)',borderRadius:10,paddingLeft:12,borderWidth:1,borderColor:'rgba(255,255,255,0.08)',marginBottom:4},customInput:{flex:1,color:'#FFF',fontSize:14,paddingVertical:10,fontFamily:'Inter_400Regular'},
   bubble:{padding:12,borderRadius:12,marginBottom:8,maxWidth:'82%'},userBubble:{backgroundColor:'#4D96FF',alignSelf:'flex-end'},aiBubble:{backgroundColor:'rgba(255,255,255,0.1)',alignSelf:'flex-start'},chatInput:{flexDirection:'row',alignItems:'center',padding:10},chatBox:{flex:1,backgroundColor:'rgba(255,255,255,0.1)',borderRadius:20,padding:10,color:'#FFF',marginRight:10},
+  aiChatHeader:{paddingTop:58,paddingHorizontal:20,paddingBottom:14,flexDirection:'row',alignItems:'center',justifyContent:'space-between',borderBottomWidth:1,borderBottomColor:'rgba(255,255,255,0.06)',backgroundColor:'rgba(5,11,20,0.92)'},
+  aiChatTitle:{fontSize:22,fontFamily:'Inter_900Black',color:'#FFF',letterSpacing:0.2},aiChatStatus:{fontSize:12,color:'#94A3B8',fontFamily:'Inter_400Regular'},statusDot:{width:7,height:7,borderRadius:7},aiEnergyPill:{fontSize:10,color:'#94A3B8',backgroundColor:'rgba(255,255,255,0.06)',paddingHorizontal:7,paddingVertical:2,borderRadius:7,overflow:'hidden'},headerIconBtn:{width:38,height:38,borderRadius:19,alignItems:'center',justifyContent:'center',backgroundColor:'rgba(255,255,255,0.05)',borderWidth:1,borderColor:'rgba(255,255,255,0.08)'},
+  aiChatScroll:{paddingHorizontal:20,paddingTop:18,paddingBottom:155},
+  ideaContextCard:{backgroundColor:'rgba(77,150,255,0.08)',borderWidth:1,borderColor:'rgba(77,150,255,0.22)',borderRadius:14,padding:12,marginBottom:18},ideaContextLabel:{fontSize:10,color:'#4D96FF',marginBottom:5,letterSpacing:0.7,fontFamily:'Inter_700Bold'},ideaContextText:{fontSize:13,color:'#E2E8F0',lineHeight:19},
+  userPromptWrap:{alignSelf:'flex-end',maxWidth:'88%',backgroundColor:'rgba(77,150,255,0.15)',borderWidth:1,borderColor:'rgba(77,150,255,0.28)',borderRadius:18,paddingHorizontal:14,paddingVertical:11,marginBottom:20},userPromptLabel:{color:'#4D96FF',fontSize:11,fontFamily:'Inter_700Bold',marginBottom:4},userPromptText:{color:'#FFF',fontSize:15,lineHeight:21,fontFamily:'Inter_400Regular'},
+  aiResponseWrap:{width:'100%',marginBottom:24},aiResponseHead:{flexDirection:'row',alignItems:'center',gap:8,marginBottom:10},aiMiniMark:{width:22,height:22,borderRadius:11,alignItems:'center',justifyContent:'center',backgroundColor:'rgba(77,150,255,0.12)',borderWidth:1,borderColor:'rgba(77,150,255,0.28)'},aiMiniCore:{width:7,height:7,borderRadius:7,backgroundColor:'#FFF'},aiName:{color:'#4D96FF',fontSize:12,fontFamily:'Inter_700Bold',letterSpacing:0.3},aiResponseBody:{paddingLeft:2,paddingRight:4},
+  aiHeading:{color:'#FFF',fontSize:17,lineHeight:24,fontFamily:'Inter_900Black',marginTop:4,marginBottom:7},aiParagraph:{color:'#E2E8F0',fontSize:15.5,lineHeight:25,fontFamily:'Inter_400Regular',marginBottom:8},aiBulletRow:{flexDirection:'row',alignItems:'flex-start',gap:8,marginBottom:6,paddingRight:8},aiBulletDot:{color:'#4D96FF',fontSize:15,lineHeight:25,minWidth:18,fontFamily:'Inter_700Bold'},aiThinkingText:{color:'#94A3B8',fontSize:15,lineHeight:24,fontFamily:'Inter_400Regular',paddingLeft:2},
+  guidedPill:{fontSize:10,color:'#D946EF',backgroundColor:'rgba(217,70,239,0.1)',borderWidth:1,borderColor:'rgba(217,70,239,0.22)',paddingHorizontal:8,paddingVertical:3,borderRadius:8,overflow:'hidden',fontFamily:'Inter_700Bold'},
+  guidedStack:{marginTop:8,gap:10},
+  stepCard:{backgroundColor:'rgba(255,255,255,0.045)',borderWidth:1,borderColor:'rgba(255,255,255,0.08)',borderRadius:16,padding:14,marginBottom:10},stepCardTop:{flexDirection:'row',alignItems:'center',gap:10,marginBottom:9},stepBadge:{width:26,height:26,borderRadius:13,alignItems:'center',justifyContent:'center',backgroundColor:'rgba(77,150,255,0.14)',borderWidth:1,borderColor:'rgba(77,150,255,0.32)'},stepBadgeText:{fontSize:12,color:'#4D96FF',fontFamily:'Inter_900Black'},stepTitle:{flex:1,color:'#FFF',fontSize:15.5,lineHeight:21,fontFamily:'Inter_900Black'},stepBody:{color:'#E2E8F0',fontSize:14.5,lineHeight:23,fontFamily:'Inter_400Regular',marginBottom:6},
+  formulaLine:{color:'#FFFFFF',fontSize:14.5,lineHeight:23,fontFamily:'Inter_700Bold',backgroundColor:'rgba(77,150,255,0.08)',borderWidth:1,borderColor:'rgba(77,150,255,0.14)',borderRadius:10,paddingHorizontal:10,paddingVertical:7,marginBottom:6,overflow:'hidden'},
+  finalCard:{backgroundColor:'rgba(44,182,125,0.08)',borderWidth:1,borderColor:'rgba(44,182,125,0.24)',borderRadius:16,padding:14,marginTop:2},finalCardTop:{flexDirection:'row',alignItems:'center',gap:8,marginBottom:8},finalTitle:{color:'#2CB67D',fontSize:14,fontFamily:'Inter_900Black'},finalBody:{color:'#FFF',fontSize:15,lineHeight:23,fontFamily:'Inter_700Bold',marginBottom:6},
+  aiComposerWrap:{flexDirection:'row',alignItems:'flex-end',gap:10,marginHorizontal:14,padding:10,borderRadius:24,backgroundColor:'rgba(15,23,42,0.96)',borderWidth:1,borderColor:'rgba(255,255,255,0.09)'},aiComposerInput:{flex:1,maxHeight:120,minHeight:42,color:'#FFF',fontSize:15,lineHeight:21,paddingHorizontal:12,paddingVertical:10,fontFamily:'Inter_400Regular'},aiSendBtn:{width:38,height:38,borderRadius:19,backgroundColor:'#4D96FF',alignItems:'center',justifyContent:'center'},
   logInput:{backgroundColor:'rgba(255,255,255,0.05)',color:'#FFF',borderRadius:12,padding:15,minHeight:100,textAlignVertical:'top',marginBottom:15},logCard:{backgroundColor:'rgba(255,255,255,0.05)',padding:15,borderRadius:12,marginBottom:10,borderLeftWidth:3,borderLeftColor:'#7F5AF0'},
   navBar:{flexDirection:'row',justifyContent:'space-around',paddingTop:15,paddingBottom:40,borderTopWidth:1,borderTopColor:'rgba(255,255,255,0.1)',backgroundColor:'#050B14',position:'absolute',bottom:0,width:'100%'},
 });
