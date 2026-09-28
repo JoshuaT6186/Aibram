@@ -1,6 +1,8 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth } from 'firebase/auth';
+import { initializeAuth, getReactNativePersistence, getAuth } from 'firebase/auth';
 import { getFirestore } from 'firebase/firestore';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Platform } from 'react-native';
 
 const firebaseConfig = {
   apiKey: 'AIzaSyDnc29fCjzhM2VV_8UltTTgvEQE-tCsZ6A',
@@ -13,6 +15,14 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 
-export const auth = getAuth(app);
+// getReactNativePersistence only exists in the native (iOS/Android) build of
+// firebase/auth — calling it on web crashes with "is not a function" since
+// that export genuinely isn't there. On web, the browser already persists
+// sessions on its own (IndexedDB/localStorage) via plain getAuth(), so no
+// extra config is needed there. On native, without this, getAuth() defaults
+// to in-memory persistence — the session is gone the moment the app closes.
+export const auth = Platform.OS === 'web'
+  ? getAuth(app)
+  : initializeAuth(app, { persistence: getReactNativePersistence(AsyncStorage) });
 export const db = getFirestore(app);
 export default app;
